@@ -14,7 +14,7 @@ Realtime Agent  ──────────────────► tasks.
   │  listens on Supabase channel         │
   │  writes task on slice:changed        │
   ▼                                      ▼
-ralph.sh loop ◄────────────────── Phase 1: load slice
+ralph loop ◄────────────────── Phase 1: load slice
   │  checks tasks.json every 3s          reads task → runs /connect + /load-slice
   │                                      fetches slice definition to .slices/
   │                                      removes task from tasks.json
@@ -34,16 +34,15 @@ Phase 2: build slice
 
 ## Step 1 — Install
 
-Run the installer in your project directory:
-
-For now
+Install the build-kit with the [eventmodelers CLI](https://github.com/Nebulit-GmbH/Eventmodelers-Build-Kits/blob/main/eventmodelers-cli/README.md):
 
 ```sh
-git clone https://github.com/Midnighter/build-kit-pyeventsourcing
+npx @eventmodelers/cli init --stack pyeventsourcing --git https://github.com/Midnighter/build-kit-pyeventsourcing
 ```
 
-Soon, you will be able to use the [eventmodelers CLI](https://github.com/Nebulit-GmbH/Eventmodelers-Build-Kits/blob/main/eventmodelers-cli/README.md):
+You can then run the realtime and build agent with the following command:
 
 ```sh
-npx @eventmodelers/cli init --stack pyeventsourcing
+npx @eventmodelers/cli run
 ```
+
