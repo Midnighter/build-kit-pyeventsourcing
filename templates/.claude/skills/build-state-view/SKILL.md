@@ -5,7 +5,14 @@ description: Implements a pyeventsourcing state-view slice (read model / project
 
 # Build State View Slice
 
-> Before doing anything else, read the slice definition from `.build-kit/.slices/{Context}/{SliceName}/slice.json` (both segments in their disk form — i.e. `snake_case({Context})/snake_case({SliceName})`). This file is the **source of truth** for all fields, events, and read-model shape. Never invent fields not defined there.
+> Before doing anything else, read the slice definition from `.build-kit/.slices/<contextSlug>/<sliceFolder>/slice.json`. This file is the **source of truth** for all fields, events, and read-model shape. Never invent fields not defined there.
+>
+> **These two path segments are lowercase slugs, not snake_case**, and they slug differently from each other — they are written by the `load-slice` skill, which owns the rules:
+>
+> - `<contextSlug>` — the context lowercased, spaces to hyphens, non-alphanumeric removed (`"My Ctx"` → `my-ctx`). Falls back to `default` when the slice has no context.
+> - `<sliceFolder>` — the slice title lowercased with **all spaces removed** and any `slice:` prefix stripped (`"View Dog Profile"` → `viewdogprofile`).
+>
+> So `ViewDogProfile` in the `Kennel` context reads from `.build-kit/.slices/kennel/viewdogprofile/slice.json`. Do **not** use the `snake_case(...)` form here — that convention applies to the generated Python paths below, not to this directory. If the path you derive is missing, list the context directory rather than guessing.
 
 Project-wide conventions (tooling, pre-commit, test layout) live in `CLAUDE.md`. Consult it for anything not specific to building a slice.
 
@@ -30,7 +37,7 @@ Check any comments in the slice definition for guidance on which approach to use
 
 From the slice definition, extract:
 - **sliceName** — the projection name (becomes the `Slice` subclass name and the query method name)
-- **context** — the bounded context (used to find `src/snake_case({Context})/events.py`)
+- **context** — the bounded context (used to find `src/snake_case({ProjectName})/snake_case({Context})/events.py`)
 - **events[]** — events this projection consumes
 - **readModel / fields** — the shape of the entries this projection exposes
 - **specifications[]** — test scenarios. If empty, still write at least one happy-path test (entity exists, projection returns expected fields) and one negative test (entity does not exist → 404).
@@ -45,6 +52,9 @@ Every placeholder in the templates below is **PascalCase**. There is only one fo
 | `{SliceName}` | `sliceName` in PascalCase | `ViewDogProfile` |
 | `{EventName}` | event type in PascalCase | `DogRegistered` |
 | `{Context}` | bounded context in PascalCase | `Kennel` |
+| `{ProjectName}` | `project.name` in `pyproject.toml`, PascalCase | `MyProject` |
+
+`{ProjectName}` is the one placeholder that does **not** come from the slice definition — read it once from `[project] name` in `pyproject.toml`. It is already fixed for the whole repository, so `snake_case({ProjectName})` is simply the existing top-level package under `src/`; confirm it there rather than deriving a name that does not exist on disk.
 
 Filesystem paths, Python module names, method names, and route prefixes are **derived from the PascalCase placeholder at code-generation time**, not carried as separate placeholders:
 
@@ -59,9 +69,9 @@ Apply these transforms mechanically; do not introduce new placeholder tokens.
 
 ## Step 2 — Ensure the shared events module exists
 
-Each context has one `src/snake_case({Context})/events.py` module holding every domain event for that context — events are shared across slices in the same context. A view **consumes** events emitted by other (state-change) slices; do not redefine them here.
+Each context has one `src/snake_case({ProjectName})/snake_case({Context})/events.py` module holding every domain event for that context — events are shared across slices in the same context. A view **consumes** events emitted by other (state-change) slices; do not redefine them here.
 
-File location: `src/snake_case({Context})/events.py`.
+File location: `src/snake_case({ProjectName})/snake_case({Context})/events.py`.
 
 ### Event pattern (for reference — the state-change slice is what creates these)
 

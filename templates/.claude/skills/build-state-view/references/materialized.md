@@ -5,6 +5,13 @@ consumes events as they are recorded and updates a standalone read model. The
 FastAPI route only ever reads that model — it never touches the event store.
 Read this only after Step 1 of `SKILL.md` selected this approach.
 
+> **The central-application pattern does not apply here.** Command slices and
+> on-demand views share one process-wide `{ProjectName}App` (see `CLAUDE.md` →
+> *Application wiring*). `ProjectionRunner` instead takes an application
+> **class** and constructs its own instance (`application_class(env=env)`), so it
+> cannot be handed the shared instance. Keep the runner-owned application as
+> written below until that gap is closed separately.
+
 The projection is expressed as an `eventsourcing.projection.Projection`
 subclass whose `process_event(envelope, tracking)` mutates a
 `TrackingRecorder` (the materialized view). A `ProjectionRunner` wires a
@@ -95,7 +102,7 @@ takes a `tracking` argument for.
 
 ## Step 3 — Create `projection.py`
 
-File: `src/snake_case({Context})/snake_case({SliceName})/projection.py`
+File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/projection.py`
 
 Four pieces live here: the view's abstract interface, its concrete
 implementation(s), the `Projection` that feeds it, and a small module-level
@@ -122,7 +129,7 @@ from eventsourcing.projection import Projection, ProjectionRunner
 from eventsourcing.pydantic import Decision, DcbApplication
 from eventsourcing.utils import EnvType, get_topic
 
-from snake_case({Context}).events import {EventName}
+from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
 
 
 @dataclass
@@ -365,7 +372,7 @@ identical either way:
 
 ## Step 4 — Create `routes.py`
 
-File: `src/snake_case({Context})/snake_case({SliceName})/routes.py`
+File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/routes.py`
 
 The route depends on the **view**, not the application — the whole point of
 materializing is that a query never touches the event store. The view
@@ -378,7 +385,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from snake_case({Context}).snake_case({SliceName}).projection import (
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import (
     {SliceName}View,
 )
 
@@ -458,8 +465,8 @@ themselves — no runner, no background thread, no `ProjectionRunner` involved:
 from eventsourcing.domain import TaggedEvent
 from eventsourcing.persistence import Tracking
 
-from snake_case({Context}).events import {EventName}
-from snake_case({Context}).snake_case({SliceName}).projection import (
+from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import (
     {EntryName},
     {SliceName}Projection,
     POPO{SliceName}View,
@@ -528,40 +535,14 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 
 import pytest
-from eventsourcing.pydantic import Selector, Slice
+from eventsourcing.domain import TaggedEvent
+from eventsourcing.projection import ProjectionRunner
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from snake_case({Context}).events import {EventName}
-from snake_case({Context}).snake_case({SliceName}).projection import create_runner
-from snake_case({Context}).snake_case({SliceName}).routes import router
-
-
-class _Emit{EventName}(Slice):
-    """Test-only slice that emits a single {EventName}, bypassing the real
-    state-change slice so this suite does not depend on its consistency rules.
-    """
-
-    def __init__(self, entity_id: str, field1: str, field2: int) -> None:
-        self._entity_id = entity_id
-        self._field1 = field1
-        self._field2 = field2
-
-    def consistency_boundary(self) -> Selector:
-        """Scope the append condition to this entity so independent writes
-        in the same test (e.g. for a second entity) never collide.
-        """
-        return Selector(types=[{EventName}], tags=[f"{{entity_kind}}:{self._entity_id}"])
-
-    def execute(self) -> None:
-        """Emit {EventName} tagged for the entity."""
-        self.trigger_event(
-            {EventName},
-            [f"{{entity_kind}}:{self._entity_id}"],
-            entity_id=self._entity_id,
-            field1=self._field1,
-            field2=self._field2,
-        )
+from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import create_runner
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).routes import router
 
 
 @pytest.fixture
@@ -581,12 +562,29 @@ def client() -> Iterator[TestClient]:
         yield test_client
 
 
-def _write_and_wait(client: TestClient, entity_id: str, field1: str, field2: int) -> None:
-    runner = client.app.state.snake_case({SliceName})_runner
-    slice_ = _Emit{EventName}(entity_id=entity_id, field1=field1, field2=field2)
-    slice_.execute()
-    position = runner.app.repository.save(slice_)
+@pytest.fixture
+def runner(client: TestClient) -> ProjectionRunner:
+    """Return the runner started by this app's lifespan."""
+    return client.app.state.snake_case({SliceName})_runner
+
+
+@pytest.fixture
+def entity_id() -> str:
+    """Return the id shared by the arrangement and the request."""
+    return "entity-1"
+
+
+@pytest.fixture
+def prior_thing(runner: ProjectionRunner, entity_id: str) -> {EventName}:
+    """Seed the fact this view projects, and wait for it to be projected."""
+    decision = {EventName}(entity_id=entity_id, field1="a", field2=1)
+    position = runner.app.events.append(
+        events=[
+            TaggedEvent(decision=decision, tags=[f"{{entity_kind}}:{entity_id}"]),
+        ],
+    )
     runner.wait(notification_id=position, timeout=5)
+    return decision
 
 
 def test_snake_case({SliceName})_missing_entity_returns_404(client: TestClient) -> None:
@@ -595,70 +593,84 @@ def test_snake_case({SliceName})_missing_entity_returns_404(client: TestClient) 
     assert response.status_code == 404
 
 
-def test_snake_case({SliceName})_returns_projected_entries(client: TestClient) -> None:
+def test_snake_case({SliceName})_returns_projected_entries(
+    client: TestClient, prior_thing: {EventName}, entity_id: str,
+) -> None:
     """After a write catches up, the route returns the projected entries."""
-    _write_and_wait(client, entity_id="entity-1", field1="a", field2=1)
-    response = client.get("/kebab-case({SliceName})/entity-1")
+    response = client.get(f"/kebab-case({SliceName})/{entity_id}")
     assert response.status_code == 200
-    assert response.json() == [{"field1": "a", "field2": 1}]
+    assert response.json() == [
+        {"field1": prior_thing.field1, "field2": prior_thing.field2},
+    ]
 
 
-def test_snake_case({SliceName})_isolates_other_entities(client: TestClient) -> None:
+def test_snake_case({SliceName})_isolates_other_entities(
+    client: TestClient, runner: ProjectionRunner,
+    prior_thing: {EventName}, entity_id: str,
+) -> None:
     """Another entity's events do not leak into this entity's view."""
-    _write_and_wait(client, entity_id="entity-1", field1="a", field2=1)
-    _write_and_wait(client, entity_id="entity-2", field1="b", field2=2)
-    response = client.get("/kebab-case({SliceName})/entity-1")
-    assert response.json() == [{"field1": "a", "field2": 1}]
+    position = runner.app.events.append(
+        events=[
+            TaggedEvent(
+                decision={EventName}(entity_id="entity-2", field1="b", field2=2),
+                tags=["{{entity_kind}}:entity-2"],
+            ),
+        ],
+    )
+    runner.wait(notification_id=position, timeout=5)
+    response = client.get(f"/kebab-case({SliceName})/{entity_id}")
+    assert response.json() == [
+        {"field1": prior_thing.field1, "field2": prior_thing.field2},
+    ]
 ```
 
 ### Integration-test notes
 
 `CLAUDE.md` covers the mechanics this fixture depends on: the mandatory
-`with TestClient(app) as ...` for lifespan-bearing apps, `save()` returning
-the append position, `wait()` over `time.sleep`, and why the emitting slice's
-`consistency_boundary()` must scope to the entity rather than being empty.
+`with TestClient(app) as ...` for lifespan-bearing apps, seeding with
+`app.events.append(events=[...])`, and `wait()` over `time.sleep`.
 Slice-specific points:
 
-- **A dedicated test-only emitting `Slice`** (`_Emit{EventName}` above) keeps
-  this suite independent of the real state-change slice's validation rules.
-  If the real emitting slice is trivial to construct and already stable,
-  writing through it instead is also fine — pick whichever keeps this test
-  file decoupled from unrelated business rules.
+- **Seed raw `TaggedEvent`s through the runner's own application.** Unlike the
+  other suites, the events must go through `runner.app` — `ProjectionRunner`
+  constructs its own `DcbApplication` (see the note at the top of this file),
+  so events appended anywhere else are invisible to the subscription.
+- **`append()` returns the position `wait()` needs.** That is the whole reason
+  the seeding fixture can synchronize: append, then wait on what it returned.
+  Never `time.sleep`.
+- **Seeding is unconditional, so it repeats freely.** `append()` builds a DCB
+  append condition only when `cb`/`after` is given; passing `events=` alone
+  imposes none. Two seeds into the same entity's tags therefore both succeed —
+  no `advance()`, no `IntegrityError`, and no test-only emitting `Slice` whose
+  `consistency_boundary()` you would have to scope by hand.
+- **Each seeded fact is its own fixture, declared in the test's signature** —
+  never a helper called from the test body. The fixture both appends *and*
+  waits, so a test that names it is guaranteed a settled view before its
+  first line runs. Fixtures compose, ids get their own fixtures so arrangement
+  and URL share one value, and each returns its `Decision` so the test asserts
+  against exactly what it arranged.
+- **Tags must satisfy Selector tags ⊆ trigger tags.** Seeding under the wrong
+  tag is silently invisible rather than an error. The view keys its state by an
+  id on the event body, but the tags still have to match what the real emitting
+  slice would use, or the projection sees a history the rest of the system does
+  not.
 - **The lifespan must stash the runner as well as the view.** The route only
-  needs `app.state.snake_case({SliceName})_view`, but `_write_and_wait` needs
-  `runner.app` to write through and `runner.wait` to synchronize — hence both
+  needs `app.state.snake_case({SliceName})_view`, but the seeding fixture needs
+  `runner.app` to append through and `runner.wait` to synchronize — hence both
   attributes in the fixture's lifespan.
 - **`create_runner()` is called bare here**, so both the `DcbApplication` and
   the view stay in memory — no database, no env vars, no teardown beyond
   exiting the `with` block. The route code exercised is identical to the
   Postgres deployment's, because it depends on the abstract `{SliceName}View`.
-- **A bare `save()` writes into a consistency boundary only once.** A freshly
-  constructed `Slice` has `last_known_position=None`, so the DCB append
-  condition asserts that *nothing* already matches its selector — a second
-  write for the same entity raises `IntegrityError`. `_write_and_wait` above is
-  therefore one-shot per entity. To emit a second event into the same boundary,
-  replay first:
-
-  ```python
-  slice_ = runner.app.repository.advance(_Emit{EventName}(...))
-  slice_.execute()
-  position = runner.app.repository.save(slice_)
-  ```
-
-  This is exactly what `app.do()` does internally (`advance` → `execute` →
-  `save`); the steps are spelled out here only because the test needs the
-  `position` that `save()` returns in order to call `wait()`. Writing to
-  *different* entities needs no `advance()`, since their boundaries are
-  disjoint.
 
 ---
 
 ## Step 7 — Wire the router and the runner lifespan into the FastAPI app
 
-Find the top-level FastAPI application (typically `src/snake_case({Context})/app.py`
-or `src/main.py`). This approach needs the app's `lifespan` to start the
-`ProjectionRunner` — combine it with any existing lifespan using
-`AsyncExitStack` rather than overwriting it:
+The top-level FastAPI application is `src/snake_case({ProjectName})/main.py`.
+Unlike the other approaches, this one *does* touch its `lifespan`, because the
+`ProjectionRunner` has to start with the app — combine it with the existing
+lifespan using `AsyncExitStack` rather than overwriting it:
 
 ```python
 from collections.abc import AsyncIterator
@@ -666,8 +678,8 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 
-from snake_case({Context}).snake_case({SliceName}).projection import create_runner
-from snake_case({Context}).snake_case({SliceName}).routes import router as snake_case({SliceName})_router
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import create_runner
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).routes import router as snake_case({SliceName})_router
 
 
 @asynccontextmanager
@@ -762,9 +774,9 @@ inside it rather than replacing the function.
 ## Files to create
 
 ```
-src/snake_case({Context})/
+src/snake_case({ProjectName})/snake_case({Context})/
     events.py                                             # shared event Decisions (add new types here; do not remove existing ones)
-src/snake_case({Context})/snake_case({SliceName})/
+src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/
     __init__.py                                           # package marker
     projection.py                                         # View interface + POPO impl (+ Postgres impl only if deployed) + Projection + create_runner()
     routes.py                                             # FastAPI router reading the view from app.state

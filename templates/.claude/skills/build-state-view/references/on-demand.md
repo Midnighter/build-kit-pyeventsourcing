@@ -6,14 +6,16 @@ this approach.
 
 The projection is expressed as an `eventsourcing.pydantic.Slice` subclass whose
 `execute()` is a no-op — the slice exists purely so its `consistency_boundary()`
-selector drives the replay. A `DcbApplication` subclass exposes a query method
-that constructs the view, replays it, and returns it.
+selector drives the replay. The route constructs the view and hands it to **the
+project's one central application**, `{ProjectName}App` in `src/snake_case({ProjectName})/application.py`,
+which replays it and returns it. A slice never defines an application of its own —
+see **Key patterns**.
 
 ```text
 Request
     │
     ▼
-DcbApplication.{query}()  # replays matching events and evolves them as view slice attributes
+{ProjectName}App.do({SliceName}View(...))  # replays matching events and evolves them as view slice attributes
     │
     ▼
 Response model
@@ -23,16 +25,16 @@ Response model
 
 ## Step 3 — Create `projection.py`
 
-File: `src/snake_case({Context})/snake_case({SliceName})/projection.py`
+File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/projection.py`
 
 Pick the consistency boundary tags first — see *Consistency boundary tags* in
 `SKILL.md`. For a single-entity read model, `tags=[]` is almost never right.
 
 ```python
 from eventsourcing.domain import event
-from eventsourcing.pydantic import DcbApplication, Selector, Slice
+from eventsourcing.pydantic import Selector, Slice
 
-from snake_case({Context}).events import {EventName}
+from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
 
 
 class {SliceName}View(Slice):
@@ -40,7 +42,7 @@ class {SliceName}View(Slice):
 
     def __init__(self, entity_id: str) -> None:
         # Query arguments live on self — `execute()` takes no args because
-        # `DcbApplication.do(slice_instance)` calls `.execute()` with no arguments.
+        # `{ProjectName}App.do(slice_instance)` calls `.execute()` with no arguments.
         self._entity_id = entity_id
         self.found = False
         self.field1 = ""
@@ -68,20 +70,11 @@ class {SliceName}View(Slice):
         """Read-only view: no command to run, no event to emit."""
         # Intentionally empty. The replay driven by `consistency_boundary()`
         # populates the attributes above before `do()` returns.
-
-
-class {SliceName}App(DcbApplication):
-    """Application that exposes the {SliceName} query."""
-
-    def snake_case({SliceName})(self, entity_id: str) -> {SliceName}View:
-        """{One-line description of the query}."""
-        view = {SliceName}View(entity_id=entity_id)
-        # `do()` takes an **instance** of the slice, not the class. It replays
-        # events matching `consistency_boundary()` through the `@event`
-        # handlers, then calls `execute()` (a no-op here).
-        self.do(view)
-        return view
 ```
+
+Notes on the template:
+
+- **`projection.py` contains the view `Slice` and nothing else.** Do not add a `DcbApplication` subclass here or anywhere in the slice package — the project has exactly one application (Step 4).
 
 ### Read-model complexity guide
 
@@ -100,27 +93,21 @@ events are already filtered to that entity, so a handful of plain attributes on
 
 ## Step 4 — Create `routes.py`
 
-File: `src/snake_case({Context})/snake_case({SliceName})/routes.py`
+File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/routes.py`
 
 ```python
-from functools import lru_cache
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from snake_case({Context}).snake_case({SliceName}).projection import {SliceName}App
+from snake_case({ProjectName}).application import {ProjectName}App, get_application
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import {SliceName}View
 
 router = APIRouter(
     prefix="/kebab-case({SliceName})",
     tags=["snake_case({SliceName})"],
 )
-
-
-@lru_cache(maxsize=1)
-def get_snake_case({SliceName})_app() -> {SliceName}App:
-    """Return a shared {SliceName}App instance."""
-    return {SliceName}App()
 
 
 class {SliceName}Response(BaseModel):
@@ -134,10 +121,10 @@ class {SliceName}Response(BaseModel):
 @router.get("/{entity_id}", response_model={SliceName}Response)
 async def snake_case({SliceName})(
     entity_id: str,
-    app: Annotated[{SliceName}App, Depends(get_snake_case({SliceName})_app)],
+    app: Annotated[{ProjectName}App, Depends(get_application)],
 ) -> {SliceName}Response:
     """{One-line description of the endpoint}."""
-    view = app.snake_case({SliceName})(entity_id=entity_id)
+    view = app.do({SliceName}View(entity_id=entity_id))
     if not view.found:
         msg = f"{entity_id} not found"
         raise HTTPException(
@@ -153,7 +140,8 @@ async def snake_case({SliceName})(
 
 Notes on the template:
 
-- **`@lru_cache(maxsize=1)`** persists the app across requests so replay uses a single event store. Integration tests must override it (see Step 6).
+- **A slice must never define its own application, nor its own dependency factory.** `get_application` is the single dependency; it reads the process-wide `{ProjectName}App` off `request.state` (Step 7 and `CLAUDE.md`).
+- **`do()` takes an instance and returns it**, having replayed the events matching `consistency_boundary()` through the `@event` handlers and then called `execute()` (a no-op here). It mutates the perspective in place *and* returns it, so `view = app.do(...)` is the documented contract.
 - **`response_model` matches the return type.** The view class is a `Slice`, not a `BaseModel`; map its attributes onto a Pydantic response model explicitly.
 
 The FastAPI/Pydantic house rules this template follows (`Annotated[…, Depends(…)]`, `EM101` message variables, runtime imports for Pydantic field types) are in `CLAUDE.md`. Status codes follow the *Error mapping* table in `SKILL.md`.
@@ -178,8 +166,8 @@ attributes.
 from eventsourcing.dcb.gwt import given
 from eventsourcing.domain import TaggedEvent
 
-from snake_case({Context}).events import {EventName}
-from snake_case({Context}).snake_case({SliceName}).projection import {SliceName}View
+from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import {SliceName}View
 
 # Reuse the same values for the entity id: the tag on `given()` events must
 # fall inside the view's consistency boundary or `when()` will not see them.
@@ -226,27 +214,15 @@ These prove the FastAPI route wires the projection correctly and returns the
 right status codes and bodies. They belong in `tests/integration/` — a separate
 hatch env from acceptance tests.
 
+**Use the shared `client` fixture from `tests/integration/conftest.py`** — do not
+build a local `FastAPI()` and do not register any `dependency_overrides`. That
+fixture wraps the real `create_app()` in a `with TestClient(...)` block, so each
+test runs the lifespan and gets its own freshly-constructed `{ProjectName}App` over its
+own in-memory store. Testing the real app is also what catches route-prefix
+collisions between slices.
+
 ```python
-import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
-from snake_case({Context}).snake_case({SliceName}).projection import {SliceName}App
-from snake_case({Context}).snake_case({SliceName}).routes import (
-    get_snake_case({SliceName})_app,
-    router,
-)
-
-
-@pytest.fixture
-def client() -> TestClient:
-    """Return a TestClient with a fresh in-memory app per test."""
-    app = FastAPI()
-    app.include_router(router)
-    fresh_app = {SliceName}App()
-    # Override the lru_cache'd factory so state does not leak across tests.
-    app.dependency_overrides[get_snake_case({SliceName})_app] = lambda: fresh_app
-    return TestClient(app)
 
 
 def test_snake_case({SliceName})_missing_entity_returns_404(client: TestClient) -> None:
@@ -255,27 +231,62 @@ def test_snake_case({SliceName})_missing_entity_returns_404(client: TestClient) 
     assert response.status_code == 404
 ```
 
-To exercise the happy path in integration you need events in the store; write
-those through the emitting state-change slice's app (share the `DcbApplication`
-instance) or through a fixture that seeds the event store directly. Cross-entity
-isolation ("another entity's events do not leak into this one's view") belongs
-here, since acceptance-level GWT refuses histories outside the boundary.
+### Arranging the events the view reads
+
+To exercise the happy path you need events in the store. **Seed them as raw
+`TaggedEvent`s** — never by driving the emitting state-change slice:
+
+```python
+@pytest.fixture
+def prior_thing(dcb_app: {ProjectName}App, entity_id: str, tags: list[str]) -> {EventName}:
+    """Seed the fact this view projects."""
+    decision = {EventName}(field1="a", field2=1)
+    dcb_app.events.append(events=[TaggedEvent(decision=decision, tags=tags)])
+    return decision
+
+
+def test_snake_case({SliceName})_returns_projected_state(
+    client: TestClient, prior_thing: {EventName}, entity_id: str,
+) -> None:
+    ...
+```
+
+The rules:
+
+- **Each seeded fact is its own `@pytest.fixture`, declared in the test's signature** — never a helper called from the test body. Fixtures compose (a richer history depends on a simpler one), so a test names only the deepest fact it needs. This also makes ordering structural: pytest resolves the graph before the body runs, so seeding cannot accidentally happen after the request under test.
+- **Ids get fixtures too**, so the arrangement and the URL share one value. Put the shared ones (`dcb_app`, ids, `tags`) in `tests/integration/conftest.py` and keep slice-specific histories in the slice's own test module.
+- **Return the seeded `Decision`** so the test can assert the response against exactly what it arranged.
+- **Raw events, not another slice.** A test for this view should not have to satisfy the emitting slice's validation rules, nor break when they change — and raw events let a test construct histories a slice would legitimately refuse to produce.
+- **Pass `events=` only** — supplying `cb`/`after` re-introduces an append condition. Omitting both is the unconditional write a seed wants.
+- **Tags must satisfy Selector tags ⊆ trigger tags.** Seeding under the wrong tag is silently invisible rather than an error.
+
+`dcb_app` is the same application the routes use, reached via
+`client.app_state["dcb_app"]` — **not** `client.app.state`, which is a different
+object that never receives lifespan state.
+
+Cross-entity isolation ("another entity's events do not leak into this one's
+view") belongs here too, since acceptance-level GWT refuses histories outside the
+boundary.
 
 ---
 
-## Step 7 — Wire the router into the FastAPI app (if a top-level app exists)
+## Step 7 — Wire the router into the central FastAPI app
 
-Find the top-level FastAPI application (typically `src/snake_case({Context})/app.py`
-or `src/main.py`) and add:
+**Mandatory for every slice.** In `src/snake_case({ProjectName})/main.py`, add the import and the
+`include_router` line inside `create_app()`:
 
 ```python
-from snake_case({Context}).snake_case({SliceName}).routes import router as snake_case({SliceName})_router
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).routes import (
+    router as snake_case({SliceName})_router,
+)
 
-app.include_router(snake_case({SliceName})_router)
+def create_app() -> FastAPI:
+    ...
+    app.include_router(snake_case({SliceName})_router)
 ```
 
-If no top-level app exists yet, skip this — the integration tests build a fresh
-`FastAPI()` per test and don't depend on it.
+Those two lines are the only per-slice change to `main.py` — the `lifespan` is
+**not** touched, and `src/snake_case({ProjectName})/application.py` is never edited at all.
 
 ---
 
@@ -283,18 +294,21 @@ If no top-level app exists yet, skip this — the integration tests build a fres
 
 - **Projection state lives on `self`.** `__init__` sets defaults; `@event` handlers mutate them; `execute()` is a no-op; the route reads them and maps to a response model.
 - **Tags scope the boundary; attributes answer the query.** `Selector.tags` narrows the replay to the affected entity; the fields on `self` then reflect that entity's projected state. Never rely on state alone with `tags=[]` unless the read model is genuinely system-wide.
-- **In-memory testing.** With no environment configuration `DcbApplication` uses the in-memory event store — one fresh app per test, no cleanup needed.
+- **One application for the whole process.** Slices never subclass `DcbApplication`. Each `DcbApplication()` instance gets its *own* in-memory store, so a per-slice application would replay an event store no writer ever writes to — the view would always report the entity absent.
+- **The application's lifetime belongs to the FastAPI lifespan.** `DcbApplication` is a context manager; hold it with `with`, never `lru_cache`, which has no teardown hook and so would skip `close()` (and, under Postgres, the connection-pool teardown).
 
 ---
 
 ## Files to create
 
 ```
-src/snake_case({Context})/
+src/snake_case({ProjectName})/
+    main.py                                               # EDITED, not created — one import + one include_router line
+src/snake_case({ProjectName})/snake_case({Context})/
     events.py                                             # shared event Decisions (add new types here; do not remove existing ones)
-src/snake_case({Context})/snake_case({SliceName})/
+src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/
     __init__.py                                           # package marker
-    projection.py                                         # View Slice + DcbApplication subclass
+    projection.py                                         # View Slice ONLY — no application class
     routes.py                                             # FastAPI router with GET endpoint
 tests/acceptance/snake_case({Context})/snake_case({SliceName})/
     test_snake_case({SliceName}).py                       # slice-level GWT tests (eventsourcing.dcb.gwt)

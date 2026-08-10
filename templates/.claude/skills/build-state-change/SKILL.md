@@ -1,11 +1,18 @@
 ---
 name: build-state-change
-description: Implements a pyeventsourcing state-change slice (Slice + DcbApplication, FastAPI route, pytest tests) from a slice.json definition
+description: Implements a pyeventsourcing state-change slice (Slice, FastAPI route, pytest tests) from a slice.json definition
 ---
 
 # Build State Change Slice
 
-> Before doing anything else, read the slice definition from `.build-kit/.slices/{Context}/{SliceName}/slice.json` (both segments in their disk form — i.e. `snake_case({Context})/snake_case({SliceName})`). This file is the **source of truth** for all fields, events, and metadata. Never invent fields not defined there.
+> Before doing anything else, read the slice definition from `.build-kit/.slices/<contextSlug>/<sliceFolder>/slice.json`. This file is the **source of truth** for all fields, events, and metadata. Never invent fields not defined there.
+>
+> **These two path segments are lowercase slugs, not snake_case**, and they slug differently from each other — they are written by the `load-slice` skill, which owns the rules:
+>
+> - `<contextSlug>` — the context lowercased, spaces to hyphens, non-alphanumeric removed (`"My Ctx"` → `my-ctx`). Falls back to `default` when the slice has no context.
+> - `<sliceFolder>` — the slice title lowercased with **all spaces removed** and any `slice:` prefix stripped (`"Admin Cancel License"` → `admincancellicense`).
+>
+> So `AdminCancelLicense` in the `Backoffice` context reads from `.build-kit/.slices/backoffice/admincancellicense/slice.json`. Do **not** use the `snake_case(...)` form here — that convention applies to the generated Python paths below, not to this directory. If the path you derive is missing, list the context directory rather than guessing.
 
 Project-wide conventions (tooling, pre-commit, test layout) live in `CLAUDE.md`. Consult it for anything not specific to building a slice.
 
@@ -18,15 +25,15 @@ A state-change slice processes a command using event sourcing. It:
 2. Validates the command against that state
 3. Emits new events if valid, raises if not
 
-The slice is expressed as an `eventsourcing.pydantic.Slice` subclass and invoked via a `DcbApplication`.
+The slice is expressed as an `eventsourcing.pydantic.Slice` subclass and invoked via **the project's one central application**, `{ProjectName}App` in `src/snake_case({ProjectName})/application.py`. A slice never defines an application of its own — see **Key patterns**.
 
 ---
 
 ## Step 1 — Read the slice.json
 
 From the slice definition, extract:
-- **sliceName** — the slice title (becomes the `Slice` subclass name and the command method name)
-- **context** — the bounded context (used to find `src/{context}/events.py`)
+- **sliceName** — the slice title (becomes the `Slice` subclass name and the route handler name)
+- **context** — the bounded context (used to find `src/snake_case({ProjectName})/snake_case({Context})/events.py`)
 - **commands[]** — list of commands with their data fields
 - **events[]** — list of events emitted by each command
 - **specifications[]** — test scenarios. If empty, still write at least one happy-path test and one invariant-violation test (e.g. "already processed").
@@ -40,11 +47,14 @@ Every placeholder in the templates below is **PascalCase**. There is only one fo
 | `{SliceName}` | `sliceName` in PascalCase | `AdminCancelLicense` |
 | `{EventName}` | event type in PascalCase | `LicenceCancelled` |
 | `{Context}` | bounded context in PascalCase | `Backoffice` |
+| `{ProjectName}` | `project.name` in `pyproject.toml`, PascalCase | `MyProject` |
+
+`{ProjectName}` is the one placeholder that does **not** come from the slice definition — read it once from `[project] name` in `pyproject.toml`. It is already fixed for the whole repository, so `snake_case({ProjectName})` is simply the existing top-level package under `src/`; confirm it there rather than deriving a name that does not exist on disk.
 
 Filesystem paths, Python module names, method names, and route prefixes are **derived from the PascalCase placeholder at code-generation time**, not carried as separate placeholders:
 
 - Python module / package path → lowercase PascalCase split on word boundaries, joined with `_` (e.g. `AdminCancelLicense` → `admin_cancel_license`).
-- Command method name → same as the Python module (snake_case).
+- Route handler name → same as the Python module (snake_case).
 - Route prefix → same rule but joined with `-` (e.g. `AdminCancelLicense` → `admin-cancel-license`).
 
 Apply these transforms mechanically; do not introduce new placeholder tokens.
@@ -53,9 +63,9 @@ Apply these transforms mechanically; do not introduce new placeholder tokens.
 
 ## Step 2 — Ensure the shared events module exists
 
-Each context has one `src/snake_case({Context})/events.py` module holding every domain event for that context — events are shared across slices in the same context.
+Each context has one `src/snake_case({ProjectName})/snake_case({Context})/events.py` module holding every domain event for that context — events are shared across slices in the same context.
 
-File location: `src/snake_case({Context})/events.py`.
+File location: `src/snake_case({ProjectName})/snake_case({Context})/events.py`.
 
 ### Event pattern
 
@@ -79,7 +89,7 @@ Add each new event type to this module. Do NOT remove existing ones.
 
 ## Step 3 — Create `slice.py`
 
-File: `src/snake_case({Context})/snake_case({SliceName})/slice.py`
+File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/slice.py`
 
 ### Choose the consistency boundary tags first
 
@@ -101,9 +111,9 @@ The same tags must be attached at **emission time** via `trigger_event(..., tags
 
 ```python
 from eventsourcing.domain import event
-from eventsourcing.pydantic import DcbApplication, Selector, Slice
+from eventsourcing.pydantic import Selector, Slice
 
-from snake_case({Context}).events import {EventName}
+from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
 
 
 class {SliceName}Slice(Slice):
@@ -144,22 +154,11 @@ class {SliceName}Slice(Slice):
             field1=self._field1,
             field2=self._field2,
         )
-
-
-class {SliceName}App(DcbApplication):
-    """Application that exposes the {SliceName} command."""
-
-    def snake_case({SliceName})(self, field1: str, field2: int) -> None:
-        """{One-line description of the command}."""
-        # `do()` takes an **instance** of the slice, not the class.
-        # It internally calls `slice.execute()` — do NOT call `.execute()` here.
-        self.do(
-            {SliceName}Slice(field1=field1, field2=field2),
-        )
 ```
 
 Notes on the template:
 
+- **`slice.py` contains the `Slice` subclass and nothing else.** Do not add a `DcbApplication` subclass here or anywhere in the slice package — the project has exactly one application (Step 4).
 - `trigger_event`'s second positional argument is the tag sequence — it is positional-only, so pass `self._tags()` before the keyword event fields.
 - If the invariant genuinely is global, drop `_tags()` and return `Selector(types=[{EventName}], tags=[])`. Add a one-line docstring on `consistency_boundary` explaining why.
 
@@ -178,28 +177,22 @@ For the common per-entity case, tag scoping does the heavy lifting — you only 
 
 ## Step 4 — Create `routes.py`
 
-File: `src/snake_case({Context})/snake_case({SliceName})/routes.py`
+File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/routes.py`
 
 ```python
 from datetime import date  # runtime import — Pydantic model field type
-from functools import lru_cache
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from snake_case({Context}).snake_case({SliceName}).slice import {SliceName}App
+from snake_case({ProjectName}).application import {ProjectName}App, get_application
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).slice import {SliceName}Slice
 
 router = APIRouter(
     prefix="/kebab-case({SliceName})",
     tags=["snake_case({SliceName})"],
 )
-
-
-@lru_cache(maxsize=1)
-def get_snake_case({SliceName})_app() -> {SliceName}App:
-    """Return a shared {SliceName}App instance."""
-    return {SliceName}App()
 
 
 class {SliceName}Request(BaseModel):
@@ -212,18 +205,24 @@ class {SliceName}Request(BaseModel):
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def snake_case({SliceName})(
     body: {SliceName}Request,
-    app: Annotated[{SliceName}App, Depends(get_snake_case({SliceName})_app)],
+    app: Annotated[{ProjectName}App, Depends(get_application)],
 ) -> dict[str, str]:
     """{One-line description of the endpoint}."""
     try:
-        app.snake_case({SliceName})(**body.model_dump())
+        app.do({SliceName}Slice(**body.model_dump()))
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
     return {}
 ```
+
+Notes on the template:
+
+- **A slice must never define its own application, nor its own dependency factory.** `get_application` is the single dependency; it reads the process-wide `{ProjectName}App` off `request.state` (Step 7 and `CLAUDE.md`).
+- `do()` takes an **instance** of the slice, not the class, and internally calls `slice.execute()` — do NOT call `.execute()` yourself.
+- Use `status.HTTP_422_UNPROCESSABLE_CONTENT`; the older `..._ENTITY` alias raises a `StarletteDeprecationWarning`.
 
 ### Error mapping
 
@@ -246,8 +245,8 @@ import pytest
 from eventsourcing.dcb.gwt import given
 from eventsourcing.domain import TaggedEvent
 
-from snake_case({Context}).snake_case({SliceName}).slice import {SliceName}Slice
-from snake_case({Context}).events import {EventName}
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).slice import {SliceName}Slice
+from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
 
 # Reuse the same values for the entity id: the tag on `given()` events must
 # fall inside the slice's consistency boundary or `when()` will not see them.
@@ -292,27 +291,10 @@ File: `tests/integration/snake_case({Context})/test_snake_case({SliceName}).py`
 
 These prove the FastAPI route wires the slice correctly and returns the right status codes and bodies. They belong in `tests/integration/` — a separate hatch env from acceptance tests.
 
+**Use the shared `client` fixture from `tests/integration/conftest.py`** — do not build a local `FastAPI()` and do not register any `dependency_overrides`. That fixture wraps the real `create_app()` in a `with TestClient(...)` block, so each test runs the lifespan and gets its own freshly-constructed `{ProjectName}App` over its own in-memory store. Testing the real app is also what catches route-prefix collisions between slices.
+
 ```python
-import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
-from snake_case({Context}).snake_case({SliceName}).routes import (
-    get_snake_case({SliceName})_app,
-    router,
-)
-from snake_case({Context}).snake_case({SliceName}).slice import {SliceName}App
-
-
-@pytest.fixture
-def client() -> TestClient:
-    """Return a TestClient with a fresh in-memory app per test."""
-    app = FastAPI()
-    app.include_router(router)
-    fresh_app = {SliceName}App()
-    # Override the lru_cache'd factory so state does not leak across tests.
-    app.dependency_overrides[get_snake_case({SliceName})_app] = lambda: fresh_app
-    return TestClient(app)
 
 
 def test_snake_case({SliceName})_returns_201(client: TestClient) -> None:
@@ -339,19 +321,53 @@ def test_snake_case({SliceName})_missing_field_returns_422(client: TestClient) -
     assert response.status_code == 422
 ```
 
----
+### Arranging prerequisite history
 
-## Step 7 — Wire the router into the FastAPI app (if a top-level app exists)
-
-Find the top-level FastAPI application (typically `src/snake_case({Context})/app.py` or `src/main.py`) and add:
+If the route under test needs events that another slice would normally have produced, **seed them as raw `TaggedEvent`s** — never by driving the other slice's route or `Slice`:
 
 ```python
-from snake_case({Context}).snake_case({SliceName}).routes import router as snake_case({SliceName})_router
+@pytest.fixture
+def prior_thing(dcb_app: {ProjectName}App, entity_id: UUID, tags: list[str]) -> {EventName}:
+    """Seed the fact this command depends on."""
+    decision = {EventName}(field1=..., field2=...)
+    dcb_app.events.append(events=[TaggedEvent(decision=decision, tags=tags)])
+    return decision
 
-app.include_router(snake_case({SliceName})_router)
+
+def test_snake_case({SliceName})_after_prior(
+    client: TestClient, prior_thing: {EventName}, entity_id: UUID,
+) -> None:
+    ...
 ```
 
-If no top-level app exists yet, skip this — the integration tests build a fresh `FastAPI()` per test and don't depend on it.
+The rules:
+
+- **Each seeded fact is its own `@pytest.fixture`, declared in the test's signature** — never a helper called from the test body. Fixtures compose (a richer history depends on a simpler one), so a test names only the deepest fact it needs. This also makes ordering structural: pytest resolves the graph before the body runs, so seeding cannot accidentally happen after the request under test.
+- **Ids get fixtures too**, so the arrangement and the request body share one value. Put the shared ones (`dcb_app`, ids, `tags`) in `tests/integration/conftest.py` and keep slice-specific histories in the slice's own test module.
+- **Return the seeded `Decision`** so the test can assert against exactly what it arranged.
+- **Raw events, not another slice.** A test for this route should not have to satisfy some other slice's validation rules, nor break when they change — and raw events let a test construct histories a slice would legitimately refuse to produce.
+- **Pass `events=` only** — supplying `cb`/`after` re-introduces an append condition. Omitting both is the unconditional write a seed wants.
+- **Tags must satisfy Selector tags ⊆ trigger tags.** Seeding under the wrong tag is silently invisible rather than an error.
+
+`dcb_app` is the same application the routes use, reached via `client.app_state["dcb_app"]` — **not** `client.app.state`, which is a different object that never receives lifespan state.
+
+---
+
+## Step 7 — Wire the router into the central FastAPI app
+
+**Mandatory for every slice.** In `src/snake_case({ProjectName})/main.py`, add the import and the `include_router` line inside `create_app()`:
+
+```python
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).routes import (
+    router as snake_case({SliceName})_router,
+)
+
+def create_app() -> FastAPI:
+    ...
+    app.include_router(snake_case({SliceName})_router)
+```
+
+Those two lines are the only per-slice change to `main.py` — the `lifespan` is **not** touched, and `src/snake_case({ProjectName})/application.py` is never edited at all.
 
 ---
 
@@ -361,18 +377,21 @@ If no top-level app exists yet, skip this — the integration tests build a fres
 - **Tags scope the boundary; state answers the invariant.** `Selector.tags` narrows the replay to the affected entity; the `bool`/`set`/counter on `self` then answers "has this already happened *here*?". Never rely on state alone with `tags=[]` unless the invariant is genuinely system-wide.
 - **Selector tags ⊆ trigger tags.** Every tag your selector asks for must be present on the event you emit; otherwise the next command replays a version of history that doesn't include it.
 - **Raise, don't return errors.** Any invalid command must raise; the route translates the exception to an HTTP status.
-- **In-memory testing.** With no environment configuration `DcbApplication` uses the in-memory event store — one fresh app per test, no cleanup needed.
+- **One application for the whole process.** Slices never subclass `DcbApplication`. Each `DcbApplication()` instance gets its *own* in-memory store, so per-slice applications silently cannot see each other's events — a member invited through one endpoint would be invisible to the next.
+- **The application's lifetime belongs to the FastAPI lifespan.** `DcbApplication` is a context manager; hold it with `with`, never `lru_cache`, which has no teardown hook and so would skip `close()` (and, under Postgres, the connection-pool teardown).
 
 ---
 
 ## Files to create
 
 ```
-src/snake_case({Context})/
+src/snake_case({ProjectName})/
+    main.py                                               # EDITED, not created — one import + one include_router line
+src/snake_case({ProjectName})/snake_case({Context})/
     events.py                                             # add new event `Decision` here (shared across slices)
-src/snake_case({Context})/snake_case({SliceName})/
+src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/
     __init__.py                                           # package marker
-    slice.py                                              # Slice subclass + DcbApplication subclass
+    slice.py                                              # Slice subclass ONLY — no application class
     routes.py                                             # FastAPI router with POST endpoint
 tests/acceptance/snake_case({Context})/snake_case({SliceName})/
     test_snake_case({SliceName}).py                       # slice-level GWT tests (eventsourcing.dcb.gwt)
