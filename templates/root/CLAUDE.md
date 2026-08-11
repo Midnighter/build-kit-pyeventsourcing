@@ -55,10 +55,72 @@ OpenTelemetry covers three seams the library gives no help with: the command pat
 - **`@pytest.fixture`** — no parentheses (`PT001`).
 - **`tests/acceptance/`** — for `Slice`-based slices (state-change, on-demand view), given/when/then tests using `eventsourcing.dcb.gwt`. For `Projection`-based slices (automation, materialized view), GWT cannot drive a `Projection`: construct the view and projection directly and call `process_event` yourself — no `DcbApplication`, no runner, no background thread.
 - **`tests/integration/`** — API-level tests using `fastapi.testclient.TestClient` against the real `create_app()`, via the shared `client` fixture in `tests/integration/conftest.py`. Never build a local `FastAPI()`: testing the real app is what catches route-prefix collisions between slices.
-- **`tests/unit/`** and **`tests/documentation/`** — reserved for their respective purposes; a placeholder test must exist in each so pytest doesn't exit with code 5.
+- **`tests/unit/`** and **`tests/documentation/`** — reserved for their respective purposes. Add real tests as soon as there's non-trivial logic to cover (a `Slice`'s `_tags()`, a validation branch, a runnable doctest); a placeholder test is only a stopgap for a suite that's genuinely empty so far, never a step to perform on principle.
 - **`with TestClient(app) as client:`, not a bare `TestClient(app)`,** whenever the app defines a `lifespan`. The `with` block is what drives the lifespan context manager; without it the state the lifespan yields never exists and every route raises `AttributeError` on `request.state.dcb_app`.
 - **Never `time.sleep` to wait for a background thread.** `TrackingRecorder.wait(context_name, notification_id, timeout)` exists for this — call it on the **view**, never on a runner (the supervisor may already have replaced it). It blocks the calling thread, not the event loop — safe to call from a sync test against an async app.
 - **Integration tests need `httpx2`** in the `integration` dependency group and a matching `integration-tests` hatch env.
+
+## First-time project setup
+
+Before the first build skill runs in a new project, check whether the files below exist. If not, create them in this order before proceeding with the skill — the build skills themselves assume all of this is already in place.
+
+1. **Resolve every `TODO` placeholder in `pyproject.toml`.** `grep -n TODO pyproject.toml` to find them all: `[project] name`, `description`, `authors`; `packages = ["src/TODO"]` and `version-file = "src/TODO/_version.py"`; `[tool.coverage.paths] source`/`omit`; `[tool.ruff] exclude`; `[tool.ruff.lint.isort] known-first-party`; `pyrefly check src/TODO`; and the three `--cov=TODO` occurrences in the `unit-tests`/`acceptance-tests`/`integration-tests` scripts. Never create `src/snake_case({ProjectName})/_version.py` by hand — `hatch-vcs` generates it at build time and it's gitignored.
+2. **Create `src/snake_case({ProjectName})/__init__.py`** — copyright header plus a one-line module docstring naming the package.
+3. **Create `src/snake_case({ProjectName})/application.py`** — the one process-wide application. Import `DcbApplication` from `eventsourcing.pydantic`, **not** the generic `eventsourcing.dcb.application` — the Pydantic module wires the `Transcoder` this project needs.
+   ```python
+   from fastapi import Request
+   from eventsourcing.pydantic import DcbApplication
+
+
+   class {ProjectName}App(DcbApplication):
+       """The single, process-wide DCB application."""
+
+
+   def get_application(request: Request) -> {ProjectName}App:
+       """Return the process-wide application from FastAPI request state."""
+       return request.state.dcb_app
+   ```
+4. **Create `src/snake_case({ProjectName})/main.py`** — a minimal bootstrap lifespan. Do **not** reach for `AsyncExitStack`/`ProjectionSupervisor` yet; that upgrade happens later, the first time a projection is added (see *Lifespan ownership* and *Supervising projections* below).
+   ```python
+   from collections.abc import AsyncIterator
+   from contextlib import asynccontextmanager
+
+   from fastapi import FastAPI
+
+   from snake_case({ProjectName}).application import {ProjectName}App
+
+
+   @asynccontextmanager
+   async def lifespan(app: FastAPI) -> AsyncIterator[dict]:
+       """Construct the process-wide application for the lifetime of the app."""
+       with {ProjectName}App() as dcb_app:
+           yield {"dcb_app": dcb_app}
+
+
+   def create_app() -> FastAPI:
+       """Build the FastAPI application, wiring in every slice's router."""
+       return FastAPI(lifespan=lifespan)
+   ```
+   Each slice's own build step adds its `include_router` line inside `create_app()` — that's the only per-slice edit to this file.
+5. **Create `tests/integration/conftest.py`** with the shared `client` fixture only — slice-specific fixtures (ids, seeded histories) belong in each slice's own test module, not here.
+   ```python
+   from collections.abc import Iterator
+
+   import pytest
+   from fastapi.testclient import TestClient
+
+   from snake_case({ProjectName}).main import create_app
+
+
+   @pytest.fixture
+   def client() -> Iterator[TestClient]:
+       """Run the app's lifespan and expose a TestClient bound to it."""
+       with TestClient(create_app()) as client:
+           yield client
+   ```
+6. **Fill in the remaining `TODO` titles** in `README.md`, `mkdocs.yml`, and `docs/index.md` with the project's display name. These don't block any tooling, but resolve them as part of setup rather than leaving them for later.
+
+Do not create placeholder tests as part of this setup — see *Test layout* below.
 
 ## pyeventsourcing DCB API quick reference
 
