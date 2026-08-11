@@ -111,12 +111,13 @@ The same tags must be attached at **emission time** via `trigger_event(..., tags
 
 ```python
 from eventsourcing.domain import event
-from eventsourcing.pydantic import Selector, Slice
+from eventsourcing.pydantic import Selector
 
+from snake_case({ProjectName}).command import CommandSlice
 from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
 
 
-class {SliceName}Slice(Slice):
+class {SliceName}Slice(CommandSlice):
     """DCB slice that processes the {SliceName} command."""
 
     def __init__(self, field1: str, field2: int) -> None:
@@ -183,10 +184,11 @@ File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName
 from datetime import date  # runtime import — Pydantic model field type
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 
 from snake_case({ProjectName}).application import {ProjectName}App, get_application
+from snake_case({ProjectName}).command import CommandResponse
 from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).slice import {SliceName}Slice
 
 router = APIRouter(
@@ -202,26 +204,42 @@ class {SliceName}Request(BaseModel):
     field2: int
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    status_code=status.HTTP_201_CREATED,
+    response_model=CommandResponse,
+    responses={
+        status.HTTP_204_NO_CONTENT: {"description": "The command recorded nothing."},
+    },
+)
 async def snake_case({SliceName})(
     body: {SliceName}Request,
     app: Annotated[{ProjectName}App, Depends(get_application)],
-) -> dict[str, str]:
+) -> CommandResponse | Response:
     """{One-line description of the endpoint}."""
     try:
-        app.do({SliceName}Slice(**body.model_dump()))
+        slice_ = app.do({SliceName}Slice(**body.model_dump()))
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
-    return {}
+    if slice_.outcome.position is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return CommandResponse(
+        event_ids=list(slice_.outcome.event_ids),
+        position=slice_.outcome.position,
+    )
 ```
 
 Notes on the template:
 
 - **A slice must never define its own application, nor its own dependency factory.** `get_application` is the single dependency; it reads the process-wide `{ProjectName}App` off `request.state` (Step 7 and `CLAUDE.md`).
 - `do()` takes an **instance** of the slice, not the class, and internally calls `slice.execute()` — do NOT call `.execute()` yourself.
+- **A command slice subclasses `CommandSlice`, never `Slice` directly.** That base is what carries `outcome` — the ids of the events the command recorded and the position they were appended at. The library's `do()` discards both (`save()`'s return value is dropped, and `collect_events()` drains `new_decisions`), so `{ProjectName}App.do()` overrides it to capture them. A slice left on bare `Slice` still works but reports an empty outcome, and its route then answers 204 for every successful command.
+- **Return the position; clients need it for read-your-writes.** It is the same value `TrackingRecorder.wait(context_name, notification_id, timeout)` polls, so a caller can tell whether a projection has caught up with its own write.
+- **`status_code` is always `HTTP_201_CREATED`, never `HTTP_200_OK`.** A command that succeeds appends events to the log, which is a creation whatever the slice's verb suggests — `AdminCancelLicense` creates a `LicenceCancelled` event. Every command route in the project therefore answers 201 on success and 204 on a no-op; those are the only two success codes.
+- **`response_model=` must be explicit on the decorator.** The return annotation is a union with `Response`, which FastAPI cannot derive a schema from.
 - Use `status.HTTP_422_UNPROCESSABLE_CONTENT`; the older `..._ENTITY` alias raises a `StarletteDeprecationWarning`.
 - **Route handlers add NO telemetry code.** Do not import OpenTelemetry here, do not open a span, do not touch `metadata`. The HTTP span comes from `FastAPIInstrumentor` in `create_app()` and the command span from `{ProjectName}App.do()` — both already exist, one level above every slice. A span opened in a route handler duplicates one of those two.
 
