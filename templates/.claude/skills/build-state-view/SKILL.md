@@ -56,14 +56,37 @@ Every placeholder in the templates below is **PascalCase**. There is only one fo
 
 `{ProjectName}` is the one placeholder that does **not** come from the slice definition — read it once from `[project] name` in `pyproject.toml`. It is already fixed for the whole repository, so `snake_case({ProjectName})` is simply the existing top-level package under `src/`; confirm it there rather than deriving a name that does not exist on disk.
 
-Filesystem paths, Python module names, method names, and route prefixes are **derived from the PascalCase placeholder at code-generation time**, not carried as separate placeholders:
+Filesystem paths, Python module names, and method names are **derived from the PascalCase placeholder at code-generation time**, not carried as separate placeholders:
 
 - Python module / package path → lowercase PascalCase split on word boundaries, joined with `_` (e.g. `ViewDogProfile` → `view_dog_profile`).
 - Query method name → same as the Python module (snake_case).
-- Route prefix → same rule but joined with `-` (e.g. `ViewDogProfile` → `view-dog-profile`).
 - Environment-variable prefix → the snake_case form upper-cased, written `upper_snake_case({SliceName})` (e.g. `ViewDogProfile` → `VIEW_DOG_PROFILE`). Only the materialized approach uses this.
 
 Apply these transforms mechanically; do not introduce new placeholder tokens.
+
+**The URL is not on this list** — see *Addressing the view* below.
+
+---
+
+## Addressing the view
+
+This applies to **both** approaches. Work the URL out before writing the route; the full rule and its table live in `CLAUDE.md` → *API addressing*.
+
+A view is addressed by **the situation the reader is looking at**, never by the projection that produces it. `/view-dog-profile/{entity_id}` names a build artefact and forces the client to know how the read model was implemented; `/dogs/{dog_id}/profile` names what they asked for.
+
+1. **Take the entity from the boundary tags** — the decision you make in *Consistency boundary tags* below. `tags=[f"dog:{dog_id}"]` gives `/dogs/{dog_id}`. Pluralise the tag kind and kebab-case it.
+2. **Name the situation**, not the slice: `profile`, `itinerary`, `upcoming-arrivals`, `cancellation-context`. Strip the `View`/`Get`/`List` verb — it is carried by the HTTP method.
+3. **Collection and search views** have no single entity to nest under. They live at the root and take query parameters: `GET /available-stays?from=…&to=…&guests=2`. A globally-scoped view (`tags=[]`) is addressed the same way.
+
+```
+ViewDogProfile     + tags=[f"dog:{dog_id}"]    ->  GET /dogs/{dog_id}/profile
+ViewHostArrivals   + tags=[f"host:{host_id}"]  ->  GET /hosts/{host_id}/upcoming-arrivals
+SearchAvailableStays (no single entity)        ->  GET /available-stays?from=…&to=…
+```
+
+4. **Check the path is free.** `grep` it in `docs/openapi.json` — the committed spec is the source of truth for what already exists (`CLAUDE.md` → *The OpenAPI spec is the source of truth*). Two views over the same entity are fine and expected (`/dogs/{dog_id}/profile` and `/dogs/{dog_id}/history`); two views on the *same path* are a bug.
+
+The slice name still has to be traceable, so it moves into the OpenAPI metadata: `tags=["snake_case({SliceName})"]` on the router and `operation_id="snake_case({SliceName})"` on the route.
 
 ---
 

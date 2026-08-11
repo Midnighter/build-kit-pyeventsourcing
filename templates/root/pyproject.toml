@@ -192,6 +192,7 @@ dependency-groups = ["docs"]
 build = "mkdocs build {args:--clean --strict}"
 serve = "mkdocs serve {args}"
 deploy = "mike deploy {args}"
+openapi = '''python -c "import json, pathlib; from TODO.main import create_app; pathlib.Path('docs/openapi.json').write_text(json.dumps(create_app().openapi(), indent=2, sort_keys=True))"'''
 
 [tool.hatch.envs.unit-tests]
 description = """Run the unit tests."""

@@ -503,10 +503,7 @@ from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).pro
     {SliceName}View,
 )
 
-router = APIRouter(
-    prefix="/kebab-case({SliceName})",
-    tags=["snake_case({SliceName})"],
-)
+router = APIRouter(tags=["snake_case({SliceName})"])
 
 
 def get_snake_case({SliceName})_view(request: Request) -> {SliceName}View:
@@ -521,15 +518,22 @@ class {EntryName}Response(BaseModel):
     field2: int
 
 
-@router.get("/{entity_id}", response_model=list[{EntryName}Response])
+# The path and the id parameter are the *worked example* (`ViewDogProfile` over
+# `tags=[f"dog:{dog_id}"]`), not placeholder tokens — substitute the entity and
+# situation you settled on in `SKILL.md` → *Addressing the view*.
+@router.get(
+    "/dogs/{dog_id}/profile",
+    response_model=list[{EntryName}Response],
+    operation_id="snake_case({SliceName})",
+)
 async def snake_case({SliceName})(
-    entity_id: str,
+    dog_id: str,
     view: Annotated[{SliceName}View, Depends(get_snake_case({SliceName})_view)],
 ) -> list[{EntryName}Response]:
     """{One-line description of the endpoint}."""
-    entries = view.get_entries(entity_id)
+    entries = view.get_entries(dog_id)
     if entries is None:
-        msg = f"{entity_id} not found"
+        msg = f"{dog_id} not found"
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=msg,
@@ -545,6 +549,14 @@ Notes on the template:
 - **No `@lru_cache`'d app factory here.** There is nothing to cache — the view is
   a long-lived object built once by the lifespan, not something a dependency
   function constructs per call.
+- **The router carries no `prefix`; the full path goes on the decorator.** One
+  greppable path string per slice and no path parameter hidden in a prefix. The
+  slice name lives on in `tags=` and `operation_id=`, which is what links the
+  endpoint back to the slice in the generated spec. Regenerate it with
+  `hatch run docs:openapi` once the router is wired in (Step 7).
+- **The path parameter takes the entity's own name** (`dog_id`), not a generic
+  `entity_id`. The view's internal `get_entries(...)` interface is unaffected —
+  that is the projection's own API, not the public one.
 - **`request.state`, never `request.app.state`.** The latter is a `State()` built
   in `Starlette.__init__` that never receives lifespan state, so reading from it
   raises `AttributeError` at request time (see `CLAUDE.md` → *Application
@@ -708,7 +720,7 @@ def prior_thing(
 
 def test_snake_case({SliceName})_missing_entity_returns_404(client: TestClient) -> None:
     """Querying an entity with no events returns HTTP 404."""
-    response = client.get("/kebab-case({SliceName})/does-not-exist")
+    response = client.get("/dogs/does-not-exist/profile")
     assert response.status_code == 404
 
 
@@ -716,7 +728,7 @@ def test_snake_case({SliceName})_returns_projected_entries(
     client: TestClient, prior_thing: {EventName}, entity_id: str,
 ) -> None:
     """After a write catches up, the route returns the projected entries."""
-    response = client.get(f"/kebab-case({SliceName})/{entity_id}")
+    response = client.get(f"/dogs/{entity_id}/profile")
     assert response.status_code == 200
     assert response.json() == [
         {"field1": prior_thing.field1, "field2": prior_thing.field2},
@@ -741,7 +753,7 @@ def test_snake_case({SliceName})_isolates_other_entities(
         notification_id=position,
         timeout=5,
     )
-    response = client.get(f"/kebab-case({SliceName})/{entity_id}")
+    response = client.get(f"/dogs/{entity_id}/profile")
     assert response.json() == [
         {"field1": prior_thing.field1, "field2": prior_thing.field2},
     ]
@@ -874,6 +886,17 @@ writing a new function: `create_view()`, `supervisor.register(...)`, and one
 key in the yielded mapping. Create `supervisor` and the `AsyncExitStack` only if
 this is the first projection in the project.
 
+Once the router is included the route exists on the real app, so **regenerate the
+spec and stage it with the slice**:
+
+```
+hatch run docs:openapi     # rewrites docs/openapi.json
+```
+
+Confirm the diff adds exactly the path you intended and changes nothing else — a
+diff that *moves* an existing endpoint means this slice took a path another one
+was already using.
+
 ### Choosing a durable backend
 
 **This lifespan is the one place the backend is chosen.** The bare
@@ -982,6 +1005,8 @@ reporting a fake backlog the moment the process starts.
 ## Files to create
 
 ```
+docs/
+    openapi.json                                          # REGENERATED, not hand-written — `hatch run docs:openapi`
 src/snake_case({ProjectName})/
     projection.py                                         # SharedAppProjectionRunner + ProjectionSupervisor (create ONLY if absent; never per-slice)
 src/snake_case({ProjectName})/snake_case({Context})/

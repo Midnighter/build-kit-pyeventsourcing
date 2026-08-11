@@ -104,35 +104,39 @@ from pydantic import BaseModel
 from snake_case({ProjectName}).application import {ProjectName}App, get_application
 from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import {SliceName}View
 
-router = APIRouter(
-    prefix="/kebab-case({SliceName})",
-    tags=["snake_case({SliceName})"],
-)
+router = APIRouter(tags=["snake_case({SliceName})"])
 
 
 class {SliceName}Response(BaseModel):
     """Response body for the {SliceName} query."""
 
-    entity_id: str
+    dog_id: str
     field1: str
     field2: int
 
 
-@router.get("/{entity_id}", response_model={SliceName}Response)
+# The path and the id parameter are the *worked example* (`ViewDogProfile` over
+# `tags=[f"dog:{dog_id}"]`), not placeholder tokens — substitute the entity and
+# situation you settled on in `SKILL.md` → *Addressing the view*.
+@router.get(
+    "/dogs/{dog_id}/profile",
+    response_model={SliceName}Response,
+    operation_id="snake_case({SliceName})",
+)
 async def snake_case({SliceName})(
-    entity_id: str,
+    dog_id: str,
     app: Annotated[{ProjectName}App, Depends(get_application)],
 ) -> {SliceName}Response:
     """{One-line description of the endpoint}."""
-    view = app.do({SliceName}View(entity_id=entity_id))
+    view = app.do({SliceName}View(entity_id=dog_id))
     if not view.found:
-        msg = f"{entity_id} not found"
+        msg = f"{dog_id} not found"
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=msg,
         )
     return {SliceName}Response(
-        entity_id=entity_id,
+        dog_id=dog_id,
         field1=view.field1,
         field2=view.field2,
     )
@@ -143,6 +147,9 @@ Notes on the template:
 - **A slice must never define its own application, nor its own dependency factory.** `get_application` is the single dependency; it reads the process-wide `{ProjectName}App` off `request.state` (Step 7 and `CLAUDE.md`).
 - **`do()` takes an instance and returns it**, having replayed the events matching `consistency_boundary()` through the `@event` handlers and then called `execute()` (a no-op here). It mutates the perspective in place *and* returns it, so `view = app.do(...)` is the documented contract.
 - **`response_model` matches the return type.** The view class is a `Slice`, not a `BaseModel`; map its attributes onto a Pydantic response model explicitly.
+- **The router carries no `prefix`; the full path goes on the decorator.** One greppable path string per slice and no path parameter hidden in a prefix. The slice name lives on in `tags=` and `operation_id=`, which is what links the endpoint back to the slice in the generated spec.
+- **The path parameter takes the entity's own name** (`dog_id`), not a generic `entity_id`. The internal `{SliceName}View(entity_id=…)` keyword is unaffected — that is the projection's own interface, not the public one.
+- **Regenerate the spec once the route is wired in** (Step 7): `hatch run docs:openapi`, then stage `docs/openapi.json` with the rest of the slice.
 
 The FastAPI/Pydantic house rules this template follows (`Annotated[…, Depends(…)]`, `EM101` message variables, runtime imports for Pydantic field types) are in `CLAUDE.md`. Status codes follow the *Error mapping* table in `SKILL.md`.
 
@@ -151,6 +158,11 @@ The FastAPI/Pydantic house rules this template follows (`Annotated[…, Depends(
 If the view exposes a list (e.g. "all licences for an organisation"), keep the
 same pattern but change the slice's `_tags()` to the parent entity, project into
 a `list[…]` on `self`, and return `list[{SliceName}Response]`.
+
+The address follows the tags, as always: a list scoped to a parent entity nests
+under it (`GET /organisations/{organisation_id}/licences`), while a list with no
+single parent goes to the root and takes query parameters
+(`GET /available-stays?from=…&to=…`).
 
 ---
 
@@ -218,8 +230,9 @@ hatch env from acceptance tests.
 build a local `FastAPI()` and do not register any `dependency_overrides`. That
 fixture wraps the real `create_app()` in a `with TestClient(...)` block, so each
 test runs the lifespan and gets its own freshly-constructed `{ProjectName}App` over its
-own in-memory store. Testing the real app is also what catches route-prefix
-collisions between slices.
+own in-memory store. Testing the real app is also the second line of defence
+against two slices claiming the same path — the first being the spec you grepped
+in *Addressing the view*.
 
 ```python
 from fastapi.testclient import TestClient
@@ -227,9 +240,11 @@ from fastapi.testclient import TestClient
 
 def test_snake_case({SliceName})_missing_entity_returns_404(client: TestClient) -> None:
     """Querying an entity with no events returns HTTP 404."""
-    response = client.get("/kebab-case({SliceName})/does-not-exist")
+    response = client.get("/dogs/does-not-exist/profile")
     assert response.status_code == 404
 ```
+
+The URL is the worked example again — use the path you chose in *Addressing the view*.
 
 ### Arranging the events the view reads
 
@@ -288,6 +303,17 @@ def create_app() -> FastAPI:
 Those two lines are the only per-slice change to `main.py` — the `lifespan` is
 **not** touched, and `src/snake_case({ProjectName})/application.py` is never edited at all.
 
+Once the router is included the route exists on the real app, so **regenerate the
+spec and stage it with the slice**:
+
+```
+hatch run docs:openapi     # rewrites docs/openapi.json
+```
+
+Confirm the diff adds exactly the path you intended and changes nothing else — a
+diff that *moves* an existing endpoint means this slice took a path another one
+was already using.
+
 ---
 
 ## Key patterns
@@ -303,6 +329,8 @@ Those two lines are the only per-slice change to `main.py` — the `lifespan` is
 ## Files to create
 
 ```
+docs/
+    openapi.json                                          # REGENERATED, not hand-written — `hatch run docs:openapi`
 src/snake_case({ProjectName})/
     main.py                                               # EDITED, not created — one import + one include_router line
 src/snake_case({ProjectName})/snake_case({Context})/

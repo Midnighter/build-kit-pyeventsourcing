@@ -65,7 +65,7 @@ OpenTelemetry covers three seams the library gives no help with: the command pat
 
 Before the first build skill runs in a new project, check whether the files below exist. If not, create them in this order before proceeding with the skill — the build skills themselves assume all of this is already in place.
 
-1. **Resolve every `TODO` placeholder in `pyproject.toml`.** `grep -n TODO pyproject.toml` to find them all: `[project] name`, `description`, `authors`; `packages = ["src/TODO"]` and `version-file = "src/TODO/_version.py"`; `[tool.coverage.paths] source`/`omit`; `[tool.ruff] exclude`; `[tool.ruff.lint.isort] known-first-party`; `pyrefly check src/TODO`; and the three `--cov=TODO` occurrences in the `unit-tests`/`acceptance-tests`/`integration-tests` scripts. Never create `src/snake_case({ProjectName})/_version.py` by hand — `hatch-vcs` generates it at build time and it's gitignored.
+1. **Resolve every `TODO` placeholder in `pyproject.toml`.** `grep -n TODO pyproject.toml` to find them all: `[project] name`, `description`, `authors`; `packages = ["src/TODO"]` and `version-file = "src/TODO/_version.py"`; `[tool.coverage.paths] source`/`omit`; `[tool.ruff] exclude`; `[tool.ruff.lint.isort] known-first-party`; `pyrefly check src/TODO`; the `from TODO.main import create_app` inside the `docs:openapi` script; and the three `--cov=TODO` occurrences in the `unit-tests`/`acceptance-tests`/`integration-tests` scripts. Never create `src/snake_case({ProjectName})/_version.py` by hand — `hatch-vcs` generates it at build time and it's gitignored.
 2. **Create `src/snake_case({ProjectName})/__init__.py`** — copyright header plus a one-line module docstring naming the package.
 3. **Create `src/snake_case({ProjectName})/application.py`** — the one process-wide application. Import `DcbApplication` from `eventsourcing.pydantic`, **not** the generic `eventsourcing.dcb.application` — the Pydantic module wires the `Transcoder` this project needs.
    ```python
@@ -140,6 +140,43 @@ Do not create placeholder tests as part of this setup — see *Test layout* belo
 - **`DcbApplication` is a context manager.** Hold it with `with`, never `lru_cache` — the latter has no teardown hook, so `close()` (and, under Postgres, the connection-pool teardown) never runs.
 - **Adding a slice touches `main.py` only** — one router import plus one `include_router` line. `application.py` is never edited *by a slice*, because `do()` is generic over any `Slice`. (The one process-wide `do()` override is written once and is not a per-slice edit — see *Command outcomes* and *Observability*.)
 - **Materialized views and automations use the shared application too.** They are *not* exempt. `ProjectionRunner` takes an application *class* and constructs its own instance, so it is unusable here — see *Projection runners* below for what to use instead.
+
+### API addressing
+
+**The URL names the business intention, never the slice.** A slice name is a build artefact; putting it in the path (`POST /admin-cancel-license/`, `GET /view-dog-profile/{id}`) publishes the internal structure as the public contract and frames every command as data editing. The address should point at what the caller wants to achieve, and a query's address at the situation it describes.
+
+**The entity segment comes from the consistency boundary.** The slice already names the entity and its id when it picks `_tags()` — reuse that decision rather than making a second one:
+
+```
+tags = [f"licence:{licence_id}"]   ->   /licences/{licence_id}/...
+```
+
+That is what makes an address checkable: a route whose entity segment disagrees with the slice's boundary tag is a bug, not a style preference.
+
+| Case | Path |
+|------|------|
+| Command on an existing entity | `POST /{entities}/{entity_id}/{intention}` — `POST /licences/{licence_id}/cancellation-requests` |
+| Command that creates the entity (id generated, or the tag is on the thing being created) | `POST /{intention}` — `POST /user-registrations` |
+| Global boundary (`tags=[]`) | `POST /{intention}` at root — justify it in the docstring, same rule as the empty selector |
+| Two-entity boundary (rare) | Nest under the entity the command *mutates*; the other stays in the body |
+| Single-entity view | `GET /{entities}/{entity_id}/{situation}` — `GET /dogs/{dog_id}/profile` |
+| Collection / search view | `GET /{situation-plural}?params` — `GET /available-stays?from=…&to=…` |
+
+- **`{entities}`** — the boundary tag's kind, pluralised, kebab-case.
+- **`{intention}`** — the command's verb nominalised to a plural noun of intent: cancel → `cancellation-requests`, register → `registrations`, approve → `approvals`, withdraw → `withdrawal-requests`, book → `booking-requests`. Where the nominalisation is awkward, fall back to `{verb}-requests`.
+- **`{situation}`** — what the reader is looking at, not what the projection is called: `profile`, `itinerary`, `upcoming-arrivals`, `cancellation-context`. `ViewDogProfile` is the slice; `profile` is the situation.
+- **The slice name still has to be traceable, so it moves to the OpenAPI metadata** — `tags=["snake_case({SliceName})"]` on the router and an explicit `operation_id="snake_case({SliceName})"` on the route. The generated spec is what links an endpoint back to the slice that built it.
+- **The full path goes on the decorator; the router carries no `prefix`.** One greppable path string per slice, no path parameters hidden in a prefix, and no trailing-slash wart.
+- **The entity id is a path parameter, not a body field**, whenever the command is nested under an entity. Drop it from the request model and pass it alongside: `{SliceName}Slice(licence_id=licence_id, **body.model_dump())`.
+- **Operational routes are exempt.** `/healthz` and anything like it is infrastructure, not domain — leave it flat.
+
+### The OpenAPI spec is the source of truth
+
+Addresses now take per-slice judgement, so nothing guarantees a rebuild lands on the same URL. `docs/openapi.json` is the record that closes that gap: it is generated from the real `create_app()`, committed, and regenerated by the `hatch-docs-openapi` pre-commit hook on every change. A renamed or colliding endpoint shows up as a diff in a file under review rather than as a silent break.
+
+- **Read it before choosing a path.** `grep` the spec for the path you intend to use; if it is taken, the slice needs a different intention noun (or you have mis-identified the entity).
+- **Never hand-edit it.** Change the route, run `hatch run docs:openapi`, stage the result.
+- It does not exist until the first slice with a route is built — that is expected, not a setup step you missed.
 
 ### Command outcomes
 
