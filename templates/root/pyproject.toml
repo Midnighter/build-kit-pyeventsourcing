@@ -30,11 +30,11 @@ dependencies = [
     "eventsourcing[pydantic,postgres,umadb] ~=10.0.0a7",
     "psycopg[binary] ~=3.3",
     "fastapi",
+    "opentelemetry-api",
 ]
 
 [project.optional-dependencies]
 telemetry = [
-    "opentelemetry-api",
     "opentelemetry-sdk",
     "opentelemetry-instrumentation-fastapi",
     "opentelemetry-exporter-otlp-proto-grpc",
@@ -154,6 +154,7 @@ features = []
 description = """Development environment."""
 dependency-groups = ["style", "types", "docs", "tests", "integration"]
 extra-dependencies = ["pre-commit"]
+features = ["telemetry"]
 
 [tool.hatch.envs.dev.env-vars]
 PYTHONDEVMODE = "1"
@@ -180,6 +181,7 @@ check = ["pip-audit"]
 [tool.hatch.envs.types]
 description = """Check the static types of the codebase."""
 dependency-groups = ["types"]
+features = ["telemetry"]
 
 [tool.hatch.envs.types.scripts]
 check = ["pyrefly check src/TODO"]

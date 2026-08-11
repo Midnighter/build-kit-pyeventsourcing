@@ -48,7 +48,7 @@ OpenTelemetry covers three seams the library gives no help with: the command pat
 - **`process_event` spans are links, never children.** Two independent reasons: the producing span ended long before (often minutes), and `BaseProjectionRunner`'s processing thread is a bare `threading.Thread`, which does **not** inherit contextvars — so ambient propagation is not merely wrong here, it is impossible. Use `SpanKind.CONSUMER` with a `Link`, per the OTel messaging conventions for temporally decoupled producers and consumers.
 - **Instrumentation must never swallow an exception.** A span context manager that suppresses is the blanket `try/except` around `process_event` wearing a different hat: it advances past a poison event and diverges the view from the log permanently while `/healthz` still reports 200. Record the exception on the span and **re-raise**, so the supervisor still sees the thread die.
 - **Guard `None` in metrics.** `recorder.head()` and `max_tracking_id()` both return `int | None`. Before a projection has processed anything its lag is *undefined*, not zero — skip the observation rather than reporting a fake backlog.
-- **The SDK belongs to the `telemetry` extra, and the `dev` env alone.** The test suites deliberately do not install it, so they exercise the no-op path. Don't add it to a test env to assert on spans; construct an in-memory provider inside the test instead.
+- **`opentelemetry-api` is a required dependency; only the *SDK* belongs to the `telemetry` extra, and the `dev` env alone.** Split them deliberately: `telemetry.py` and the `do()` override import from the API at module scope, so an API that is merely optional breaks every suite at import time — the no-op path is an API-level proxy to `NoOpTracer` and still needs the API installed. Put `opentelemetry-api` in `[project] dependencies` and **not** in the extra as well; listing it in both lets the extra pin or reinstall it independently of the base requirement. The extra holds sdk/exporter/instrumentation only. The test suites deliberately do not install *that*, so they exercise the no-op path. Don't add the SDK to a test env to assert on spans; construct an in-memory provider inside the test instead.
 
 ## Test layout
 
@@ -65,7 +65,7 @@ OpenTelemetry covers three seams the library gives no help with: the command pat
 
 Before the first build skill runs in a new project, check whether the files below exist. If not, create them in this order before proceeding with the skill — the build skills themselves assume all of this is already in place.
 
-1. **Resolve every `TODO` placeholder in `pyproject.toml`.** `grep -n TODO pyproject.toml` to find them all: `[project] name`, `description`, `authors`; `packages = ["src/TODO"]` and `version-file = "src/TODO/_version.py"`; `[tool.coverage.paths] source`/`omit`; `[tool.ruff] exclude`; `[tool.ruff.lint.isort] known-first-party`; `pyrefly check src/TODO`; the `from TODO.main import create_app` inside the `docs:openapi` script; and the three `--cov=TODO` occurrences in the `unit-tests`/`acceptance-tests`/`integration-tests` scripts. Never create `src/snake_case({ProjectName})/_version.py` by hand — `hatch-vcs` generates it at build time and it's gitignored.
+1. **Resolve every `TODO` placeholder in `pyproject.toml`.** `grep -n TODO pyproject.toml` to find them all: `[project] name`, `description`, `authors`; `packages = ["src/TODO"]` and `version-file = "src/TODO/_version.py"`; `[tool.coverage.paths] source`/`omit`; `[tool.ruff] exclude`; `[tool.ruff.lint.isort] known-first-party`; `pyrefly check src/TODO`; and the three `--cov=TODO` occurrences in the `unit-tests`/`acceptance-tests`/`integration-tests` scripts. Never create `src/snake_case({ProjectName})/_version.py` by hand — `hatch-vcs` generates it at build time and it's gitignored.
 2. **Create `src/snake_case({ProjectName})/__init__.py`** — copyright header plus a one-line module docstring naming the package.
 3. **Create `src/snake_case({ProjectName})/application.py`** — the one process-wide application. Import `DcbApplication` from `eventsourcing.pydantic`, **not** the generic `eventsourcing.dcb.application` — the Pydantic module wires the `Transcoder` this project needs.
    ```python
@@ -236,3 +236,30 @@ One unhandled exception in `process_event` **permanently kills** the processing 
 - **`repository.save()` is not a seeding API** — it takes a `Perspective` and derives an append condition from its `consistency_boundary()`/`last_known_position`. `app.events` is the `DcbEventStore`; that is the seeding primitive.
 - **Reach the app under test via `client.app_state["dcb_app"]`**, not `client.app.state` — the latter is a `State()` built in `Starlette.__init__` that never receives lifespan state and raises `AttributeError`.
 - **GWT refuses histories outside the consistency boundary.** Prior events on `given()` must carry tags overlapping the slice's `consistency_boundary()`, or `when()` raises `AssertionError("Consistency boundary wouldn't have selected: ...")`. This is deliberate — but it means cross-entity isolation ("another entity's events don't leak into this one") can't be proven at the acceptance level. That property belongs in the integration suite.
+
+## Regenerating lock files
+
+`requirements.txt` and `requirements/requirements-<env>.txt` are hatch-pip-compile
+lock files, and they are committed. **Never** regenerate them by creating or syncing a
+single environment (`hatch env create dev` and friends) — the envs share a
+`pip-compile-constraint = "dev"`, so a partial regeneration leaves the rest of the lock
+files pinned against a stale constraint hash. After **any** change to `dependencies`,
+`[project.optional-dependencies]`, `[dependency-groups]`, or an env's `features` /
+`extra-dependencies`, regenerate all of them together:
+
+1. Remove the existing lock files:
+   ```
+   rm -rf requirements*
+   ```
+2. Remove all existing hatch environments:
+   ```
+   hatch env prune
+   ```
+3. Recreate every environment, which regenerates the lock files:
+   ```
+   hatch env show --json \
+     | jq -r 'keys[] | select(startswith("hatch-") | not)' \
+     | xargs -I{} sh -c 'hatch env create "{}"'
+   ```
+
+Commit the regenerated lock files alongside the `pyproject.toml` change that caused them.
