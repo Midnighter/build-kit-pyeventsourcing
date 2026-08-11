@@ -32,6 +32,14 @@ dependencies = [
     "fastapi",
 ]
 
+[project.optional-dependencies]
+telemetry = [
+    "opentelemetry-api",
+    "opentelemetry-sdk",
+    "opentelemetry-instrumentation-fastapi",
+    "opentelemetry-exporter-otlp-proto-grpc",
+]
+
 [dependency-groups]
 style = ["pydoclint", "ruff"]
 types = ["pyrefly"]
@@ -131,7 +139,6 @@ All environments inheriting from the default also inherit the configuration valu
 here.
 """
 type = "pip-compile"
-lock-filename = "requirements/requirements-{env_name}.txt"
 pip-compile-constraint = "dev"
 pip-compile-hashes = true
 pip-compile-resolver = "uv"

@@ -443,6 +443,28 @@ crash); `causation_id` is the **trigger event's own uuid**, naming the direct ca
 invent for those. Deriving the metadata at the call site instead of inside `_fire` is
 what lets both paths share one method.
 
+### Telemetry — skip if the project has no `telemetry.py`
+
+Wrap the `match` in `process_event` in a single `consumer_span(envelope, ...)`, as
+`build-state-view`'s materialized reference describes. That one span buys the whole
+causal chain here, because `_fire` runs **inside** it: the command it issues opens its
+own span under the consumer span, and the events that command emits inherit the
+`traceparent` from the contextvar — so a trace runs trigger event → automation →
+command → emitted event, across threads and across the log. This is the payoff of the
+design; nothing further is needed to get it.
+
+Two points specific to automations:
+
+- **`_fire`'s `except` stays exactly as it is.** The no-swallow rule for spans governs
+  the span around `process_event`, which must re-raise so the supervisor sees the
+  thread die. `_fire`'s guard is the deliberate exception to that: it is narrowly
+  scoped to the command port, and the lingering ledger entry *is* the signal. Record
+  the exception on the current span before logging it — do not widen the guard, and do
+  not let the span's own error handling suppress what `_fire` already handled.
+- **`drain()` fires with no envelope**, so those commands start a fresh trace. Entries
+  orphaned by a crash link to producer traces that may already be outside the
+  retention window. Expected, not a bug to code around.
+
 ---
 
 ## Step 4 — Recovery: the orphaned-entry problem
@@ -678,6 +700,11 @@ async with AsyncExitStack() as stack:
   synchronize on.
 - **An automation with no HTTP surface still belongs in this lifespan.** Do not give it
   its own process or its own application; the loop only closes over a shared store.
+- **An instrumented project counts restarts here.** The supervisor is the only place
+  that knows a runner died, so increment a restart counter where it rebuilds one, and
+  expose lag as an observable gauge (see `build-state-view` → *Reporting projection
+  health*). An automation with no route needs this more than a view does, not less:
+  without an HTTP surface, a silently dead automation has no other symptom.
 
 ---
 
@@ -1014,3 +1041,4 @@ The command slice under
 - [ ] The seeded event carries every tag the command slice's boundary selects on
 - [ ] The `drain()` recovery test builds its own view and app, consuming the position **before** any runner is constructed
 - [ ] No `routes.py` created (automations are not exposed via HTTP)
+- [ ] If the project has `telemetry.py`: `process_event`'s `match` is wrapped in one `consumer_span(envelope, ...)` that re-raises, and `_fire`'s narrow guard is left untouched

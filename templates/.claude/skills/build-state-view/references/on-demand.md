@@ -296,6 +296,7 @@ Those two lines are the only per-slice change to `main.py` — the `lifespan` is
 - **Tags scope the boundary; attributes answer the query.** `Selector.tags` narrows the replay to the affected entity; the fields on `self` then reflect that entity's projected state. Never rely on state alone with `tags=[]` unless the read model is genuinely system-wide.
 - **One application for the whole process.** Slices never subclass `DcbApplication`. Each `DcbApplication()` instance gets its *own* in-memory store, so a per-slice application would replay an event store no writer ever writes to — the view would always report the entity absent.
 - **The application's lifetime belongs to the FastAPI lifespan.** `DcbApplication` is a context manager; hold it with `with`, never `lru_cache`, which has no teardown hook and so would skip `close()` (and, under Postgres, the connection-pool teardown).
+- **An on-demand view needs no telemetry code at all.** It has no background thread and no consumer side: the request's HTTP span (from `FastAPIInstrumentor`) already covers it end to end, and the replay it performs shows up as the event-store span. Do not import OpenTelemetry into `projection.py` or `routes.py`, and do not open a span around the replay — that is the materialized approach's concern, not this one.
 
 ---
 

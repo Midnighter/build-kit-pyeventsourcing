@@ -429,6 +429,40 @@ wildcard, and persisting `tracking` on every branch. Slice-specific points:
   whatever id field the event carries (`entity_id` in the template). Take that
   id straight from the event's `case` pattern; do not invent a tag-derived key.
 
+### Instrumenting `process_event`
+
+Skip this if the project has no `src/snake_case({ProjectName})/telemetry.py`.
+Otherwise wrap the whole `match` in one consumer span, which is the only place
+a projection needs telemetry:
+
+```python
+    def process_event(
+        self,
+        envelope: TaggedEvent[Decision],
+        tracking: Tracking,
+    ) -> None:
+        """Dispatch on decision type and update the view, or just track the position."""
+        with consumer_span(envelope, "snake_case({SliceName})"):
+            match envelope.decision:
+                ...
+```
+
+`consumer_span` extracts the `traceparent` the writing command left in
+`envelope.metadata`, and — when that context is valid — opens a
+`SpanKind.CONSUMER` span carrying a `Link` back to it.
+
+- **A link, not a child span.** The producing request finished long ago, and
+  this runs on a bare `threading.Thread` that inherits no contextvars, so there
+  is no ambient context to be a child *of*. `CLAUDE.md` → *Observability*.
+- **The span must not swallow the exception.** Record it and re-raise. A
+  projection that logs an error and advances past a poison event diverges from
+  the log permanently while `/healthz` still reports 200 — the same failure the
+  blanket-`try/except` rule already forbids.
+- **Wrapping does not change the tracking rules.** Every branch inside the span
+  still persists `tracking`, wildcard included, or `wait()` hangs until timeout.
+- **Events written before instrumentation carry no `traceparent`.** The span is
+  then unlinked rather than absent; that is expected, not a bug to code around.
+
 ### Read-model complexity guide
 
 Every collection is keyed by entity id inside the view rather than scoped by a
@@ -888,6 +922,21 @@ async def healthz(request: Request) -> dict[str, str]:
 
 **It reports; it never restarts.** Recovery is the supervisor's job, so health
 checks stay free of side effects (see `CLAUDE.md` → *Supervising projections*).
+
+If the project is instrumented, register the view's lag as an observable gauge
+alongside this route — it is the metric that distinguishes "healthy" from
+"running but hopelessly behind", which `failures()` alone cannot tell you:
+
+```python
+head = app.recorder.head()
+tracked = view.max_tracking_id(app.context_name)
+if head is not None and tracked is not None:
+    yield Observation(head - tracked, {"projection": "snake_case({SliceName})"})
+```
+
+**Both calls return `int | None`.** Before the projection has processed
+anything its lag is *undefined*, not zero — skip the observation rather than
+reporting a fake backlog the moment the process starts.
 
 ---
 

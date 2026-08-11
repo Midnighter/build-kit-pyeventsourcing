@@ -223,6 +223,7 @@ Notes on the template:
 - **A slice must never define its own application, nor its own dependency factory.** `get_application` is the single dependency; it reads the process-wide `{ProjectName}App` off `request.state` (Step 7 and `CLAUDE.md`).
 - `do()` takes an **instance** of the slice, not the class, and internally calls `slice.execute()` — do NOT call `.execute()` yourself.
 - Use `status.HTTP_422_UNPROCESSABLE_CONTENT`; the older `..._ENTITY` alias raises a `StarletteDeprecationWarning`.
+- **Route handlers add NO telemetry code.** Do not import OpenTelemetry here, do not open a span, do not touch `metadata`. The HTTP span comes from `FastAPIInstrumentor` in `create_app()` and the command span from `{ProjectName}App.do()` — both already exist, one level above every slice. A span opened in a route handler duplicates one of those two.
 
 ### Error mapping
 
@@ -369,6 +370,8 @@ def create_app() -> FastAPI:
 
 Those two lines are the only per-slice change to `main.py` — the `lifespan` is **not** touched, and `src/snake_case({ProjectName})/application.py` is never edited at all.
 
+If the project is instrumented, `create_app()` already calls `configure_telemetry()` and `FastAPIInstrumentor.instrument_app(app)`, and `application.py` already overrides `do()`. Those are process-wide, written once, and **not** per-slice edits — leave them alone; your slice inherits them for free.
+
 ---
 
 ## Key patterns
@@ -379,6 +382,7 @@ Those two lines are the only per-slice change to `main.py` — the `lifespan` is
 - **Raise, don't return errors.** Any invalid command must raise; the route translates the exception to an HTTP status.
 - **One application for the whole process.** Slices never subclass `DcbApplication`. Each `DcbApplication()` instance gets its *own* in-memory store, so per-slice applications silently cannot see each other's events — a member invited through one endpoint would be invisible to the next.
 - **The application's lifetime belongs to the FastAPI lifespan.** `DcbApplication` is a context manager; hold it with `with`, never `lru_cache`, which has no teardown hook and so would skip `close()` (and, under Postgres, the connection-pool teardown).
+- **Emitted events carry trace context for free.** `{ProjectName}App.do()` opens the command span and puts the `traceparent` into the event-metadata contextvar, from which every `TaggedEvent` constructed inside `execute()` inherits it. Never set `metadata["traceparent"]` by hand in a slice, and never pass `metadata=` to `trigger_event` for this purpose — that bypasses the contextvar and produces events that link to nothing.
 
 ---
 
