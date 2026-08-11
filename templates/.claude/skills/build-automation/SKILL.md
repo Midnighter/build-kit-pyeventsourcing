@@ -24,16 +24,17 @@ An automation slice reacts to events and fires a command in response — a
 **state-change slice driven by a policy** instead of by an HTTP route.
 
 In this codebase that is a `Projection` running under a runner. The runner
-subscribes to a `DcbApplication` via `application_subscription`; for each event
-it calls the projection's `process_event`, which maintains a `TrackingRecorder`
-view and issues the command. The view holds both the outstanding work and the
-position of the last processed event.
+subscribes to the **shared, process-wide `{ProjectName}App`** via
+`application_subscription`; for each event it calls the projection's
+`process_event`, which maintains a `TrackingRecorder` view and issues the
+command. The view holds both the outstanding work and the position of the last
+processed event.
 
 ```
-DcbApplication  ──subscription──▶  Projection.process_event
-      ▲                                    │
-      │                                    ├──▶ view.add_entry(entry, tracking)
-      └────────── command ◀────────────────┘
+{ProjectName}App  ──subscription──▶  Projection.process_event
+   (SHARED)  ▲                              │
+      │                                     ├──▶ view.add_entry(entry, tracking)
+      └────────── command ◀─────────────────┘
                      │
                      ▼
              emits new event ──▶ back through the same subscription
@@ -44,6 +45,12 @@ The last arrow is the point. Events the automation emits **come back through the
 same subscription**, and that is what drains the entry. The view is simultaneously
 the automation's input state and its ledger of unfinished work — but only if
 something actually reads that ledger back. See Step 4.
+
+That loop only closes when the automation subscribes to the *same* application
+the command writes through. A runner that constructs its own `DcbApplication`
+gets a private in-memory store: it never sees its trigger, and the event its own
+command emits never comes back to drain the ledger. That is why Step 5 uses
+`SharedAppProjectionRunner` — see `CLAUDE.md` → *Projection runners*.
 
 ---
 
@@ -119,9 +126,16 @@ Two automation-specific constraints that build-state-change will not tell you:
 
 File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/projection.py`
 
-Three pieces live here: the view (its abstract interface plus a concrete
-implementation), the `Projection` that maintains it, and a module-level `create_runner()`
-factory used by both the app lifespan and the tests (Step 5).
+Four pieces live here: the view (its abstract interface plus a concrete
+implementation), the `Projection` that maintains it, and the two module-level factories
+`create_view()` and `create_runner()` used by both the app lifespan and the tests
+(Step 5).
+
+**The two factories are separate on purpose.** The view is the automation's ledger and
+must outlive any single runner: the supervisor rebuilds a dead runner over the *same*
+view, so it resumes at `max_tracking_id` with its outstanding entries intact. If
+`create_runner()` also built the view, every restart would strand the pending work and
+replay from zero.
 
 The templates below are shown one piece at a time. Together they need these imports and
 module-level constants:
@@ -141,10 +155,12 @@ from eventsourcing.domain import (
 )
 from eventsourcing.persistence import InfrastructureFactory, Tracking, TrackingRecorder
 from eventsourcing.popo import POPOTrackingRecorder
-from eventsourcing.projection import BaseProjectionRunner, Projection
-from eventsourcing.pydantic import Decision, DcbApplication
+from eventsourcing.projection import Projection
+from eventsourcing.pydantic import Decision
 from eventsourcing.utils import Environment, EnvType, get_topic
 
+from snake_case({ProjectName}).application import {ProjectName}App
+from snake_case({ProjectName}).projection import SharedAppProjectionRunner
 from snake_case({ProjectName}).snake_case({Context}).events import (
     {EmittedEventName},
     {TriggerEventName},
@@ -346,11 +362,11 @@ class {SliceName}Projection(
         self._command = command
 ```
 
-The command is **injected, not reached for**. This is forced by the library:
-`ProjectionRunner.__init__` constructs `projection_class(view=view)` and never
-passes the application, so a projection has no path to the write side on its own.
-Injection is also what makes the projection testable with no app, no runner, and
-no background thread.
+The command is **injected, not reached for**. A `Projection` receives only its view,
+never the application, so it has no path to the write side on its own — and it should
+not: injection is what makes the projection testable with no app, no runner, and no
+background thread. `create_runner()` (Step 5) closes the port over the shared
+application.
 
 ### process_event
 
@@ -460,6 +476,10 @@ Call it in `create_runner()` **before** constructing the runner, so it completes
 before the subscription starts. This is the baseline recovery path and the **only**
 one available when the model has no failure event.
 
+Because the supervisor restarts a dead runner by calling `create_runner()` again,
+`drain()` runs on every restart too — which is exactly right: a runner that died
+mid-`process_event` may have left an entry recorded but never commanded.
+
 ### 4b. Failure events — skip this section unless the model defines one
 
 **This whole section is conditional.** If Step 1 found no failure event among the
@@ -519,33 +539,36 @@ re-firing on each boot.
 
 ## Step 5 — Assemble the runner
 
-The stock `ProjectionRunner` cannot inject the command port. It takes *classes* —
-`application_class`, `projection_class`, `view_class` — and constructs everything
-itself, calling `projection_class(view=view)` with no opportunity to pass anything
-else. Since the command port is a constructor argument (Step 3), that closes the door.
+The stock `ProjectionRunner` is unusable here for **two** independent reasons. It takes
+*classes* — `application_class`, `projection_class`, `view_class` — and constructs
+everything itself: it calls `projection_class(view=view)` with no opportunity to pass the
+command port (Step 3), and it calls `application_class(env=env)`, giving the projection a
+**private** event store. Under POPO that store is invisible to the routes that emit the
+trigger, so the automation would never fire, and the event its own command emits would
+never come back to drain the ledger.
 
-`BaseProjectionRunner` is the layer underneath: `ProjectionRunner` subclasses it, doing
-the class-to-instance resolution and then delegating. `BaseProjectionRunner` itself takes
-an **already-constructed** `projection`, `app`, and `tracking_recorder`, which is exactly
-the seam an injected port needs. Both live in `eventsourcing.projection`.
+`SharedAppProjectionRunner` (in `src/snake_case({ProjectName})/projection.py`) is the
+answer to both. It subclasses `BaseProjectionRunner`, which takes an
+**already-constructed** `projection`, `app`, and `tracking_recorder` — exactly the seam an
+injected port needs — and it overrides `__exit__` to not close the application it was
+handed. Create that module if it does not exist yet; it is shared runtime, written once
+per project, never generated per slice. See `CLAUDE.md` → *Projection runners* for what
+it must guarantee.
 
-Using it means doing by hand the one thing `ProjectionRunner` was doing for you:
-resolving the `InfrastructureFactory` and asking it for the view. That is what the
-`Environment` + `InfrastructureFactory.construct` lines below are — not incidental
-plumbing, but the backend selection described in Step 3, now written out explicitly.
-Naming the `Environment` after `{SliceName}Projection.name` is what activates the
-`upper_snake_case({SliceName})_PERSISTENCE_MODULE` scoping.
-
-Subclass it to keep the view reachable the way `ProjectionRunner` would:
+Building the view by hand is the one thing `ProjectionRunner` was legitimately doing for
+you. That is what the `Environment` + `InfrastructureFactory.construct` lines below are —
+not incidental plumbing, but the backend selection described in Step 3, written out
+explicitly. Naming the `Environment` after `{SliceName}Projection.name` is what activates
+the `upper_snake_case({SliceName})_PERSISTENCE_MODULE` scoping.
 
 ```python
-class {SliceName}Runner(BaseProjectionRunner[DcbApplication]):
+class {SliceName}Runner(SharedAppProjectionRunner):
     """..."""
 
     def __init__(
         self,
         view: {SliceName}View,
-        app: DcbApplication,
+        app: {ProjectName}App,
         projection: {SliceName}Projection,
     ) -> None:
         self.view = view
@@ -558,11 +581,11 @@ class {SliceName}Runner(BaseProjectionRunner[DcbApplication]):
         )
 
 
-def create_runner(
+def create_view(
     view_class: type[{SliceName}View] = POPO{SliceName}View,
     env: EnvType | None = None,
-) -> {SliceName}Runner:
-    """..."""
+) -> {SliceName}View:
+    """Build the {SliceName} ledger view. Called ONCE per process."""
     environment = Environment(
         {SliceName}Projection.name,
         {**os.environ, **(env or {})},
@@ -570,8 +593,18 @@ def create_runner(
     factory: InfrastructureFactory[{SliceName}View] = (
         InfrastructureFactory.construct(env=environment)
     )
-    view = factory.tracking_recorder(view_class)
-    app: DcbApplication = DcbApplication(env=env)
+    return factory.tracking_recorder(view_class)
+
+
+def create_runner(
+    app: {ProjectName}App,
+    view: {SliceName}View,
+) -> {SliceName}Runner:
+    """Construct a runner driving `view` from the shared application.
+
+    Safe to call repeatedly against the same view: the supervisor calls this
+    again on every restart.
+    """
 
     def command(entry: {EntryName}) -> None:
         app.do({CommandSliceName}(...))
@@ -592,11 +625,59 @@ def create_runner(
     return {SliceName}Runner(view=view, app=app, projection=projection)
 ```
 
-The closure over `app` is the whole trick: the projection reaches the write side
-through a callable it neither owns nor can introspect.
+Points that matter:
 
-`drain()` must run **before** the runner is constructed — constructing it opens the
-subscription and starts the processing thread.
+- **The closure over `app` is the whole trick** — the projection reaches the write side
+  through a callable it neither owns nor can introspect. And because `app` is now the
+  *shared* application, the emitted event travels back through the same subscription,
+  which is what closes the loop drawn at the top of this file.
+- **`{SliceName}Runner` must set `self.view` itself.** `BaseProjectionRunner` only stores
+  `self._tracking_recorder`; `self.view` was a `ProjectionRunner`-only attribute.
+- **`drain()` must run before the runner is constructed** — constructing it opens the
+  subscription and starts the processing thread.
+- **`env` now scopes the view only.** The event store's `PERSISTENCE_MODULE` is
+  configured where `{ProjectName}App` is constructed, not here. Moving the view to
+  Postgres therefore means moving the write side separately — they are no longer coupled
+  through one `env` mapping.
+
+### Wiring it into the app lifespan
+
+The runner is started by the process-wide `ProjectionSupervisor` in
+`src/snake_case({ProjectName})/main.py`, which restarts it if the processing thread dies:
+
+```python
+async with AsyncExitStack() as stack:
+    dcb_app = stack.enter_context({ProjectName}App())   # entered FIRST -> closed LAST
+    supervisor = ProjectionSupervisor(context_name=dcb_app.context_name)
+
+    snake_case({SliceName})_view = create_view()
+    supervisor.register(
+        "snake_case({SliceName})",
+        snake_case({SliceName})_view,
+        partial(create_runner, dcb_app, snake_case({SliceName})_view),
+    )
+
+    stack.enter_context(supervisor)                     # exits BEFORE the app
+    yield {
+        "dcb_app": dcb_app,
+        "snake_case({SliceName})_view": snake_case({SliceName})_view,
+        "projection_supervisor": supervisor,
+    }
+```
+
+- **`stack.enter_context`, not `enter_async_context`** — both are sync context managers.
+- **Enter order is the teardown contract.** The application goes in first so it closes
+  last; every runner stops before the store it reads from does.
+- **One supervisor per process**, shared with every other projection. Adding this
+  automation to an app that already has one adds a `create_view()` + `register(...)` pair
+  and one key in the yielded mapping — nothing else.
+- **`register()` before entering the supervisor**; entering is what starts the runners.
+- **The lifespan yields the view, never the runner.** The supervisor swaps runners on
+  restart, so a reference held elsewhere could point at a dead one. Automations often
+  need no route at all — yield the view anyway, because that is what the tests in Step 7
+  synchronize on.
+- **An automation with no HTTP surface still belongs in this lifespan.** Do not give it
+  its own process or its own application; the loop only closes over a shared store.
 
 ---
 
@@ -702,24 +783,85 @@ Cover, in the same style:
 
 File: `tests/integration/snake_case({Context})/test_snake_case({SliceName}).py`
 
-Drive the real `create_runner()` as a context manager, and seed history as **raw
-`TaggedEvent`s** through the runner's own application — never by driving another
-slice. `ProjectionRunner`-style runners construct their own `DcbApplication`, so
-`runner.app` is the only store the subscription can see.
+Seed history as **raw `TaggedEvent`s** through the **shared application** — never by
+driving another slice, and never through a privately-constructed one. The runner
+subscribes to the application the lifespan opened, so that is the only store whose
+appends it can see.
+
+If the project has an HTTP surface, take both the app and the view from the real
+`create_app()`'s lifespan state via the shared `client` fixture (see `CLAUDE.md` →
+*Test layout*):
 
 ```python
 @pytest.fixture
-def trigger(runner: {SliceName}Runner, entity_id: str) -> TaggedEvent[Decision]:
+def dcb_app(client: TestClient) -> {ProjectName}App:
+    """Return the application opened by the real app's lifespan."""
+    return client.app_state["dcb_app"]
+
+
+@pytest.fixture
+def view(client: TestClient) -> {SliceName}View:
+    """Return the ledger view built by the projection lifespan."""
+    return client.app_state["snake_case({SliceName})_view"]
+```
+
+Otherwise build the same three objects the lifespan would, in the same order:
+
+```python
+@pytest.fixture
+def dcb_app() -> Iterator[{ProjectName}App]:
+    """Open one application, closed after every runner that reads from it."""
+    with {ProjectName}App() as app:
+        yield app
+
+
+@pytest.fixture
+def view() -> {SliceName}View:
+    """Build the ledger view once; runners come and go over it."""
+    return create_view()
+
+
+@pytest.fixture
+def runner(
+    dcb_app: {ProjectName}App, view: {SliceName}View,
+) -> Iterator[{SliceName}Runner]:
+    """Run the automation for the duration of one test."""
+    with create_runner(dcb_app, view) as started:
+        yield started
+```
+
+Fixture teardown is LIFO by dependency, so `runner` exits before `dcb_app` — the same
+ordering the lifespan's `AsyncExitStack` enforces in production.
+
+The seeding fixture then appends through the app and waits on the **view**:
+
+```python
+@pytest.fixture
+def trigger(
+    dcb_app: {ProjectName}App,
+    view: {SliceName}View,
+    runner: {SliceName}Runner,
+    entity_id: str,
+) -> TaggedEvent[Decision]:
     """Seed the trigger event and wait for the automation to settle."""
     seed = TaggedEvent(
         decision={TriggerEventName}(entity_id=entity_id, field="value"),
         tags=[f"{{entity_kind}}:{entity_id}"],
         metadata={"correlation_id": "corr-1"},
     )
-    position = runner.app.events.append(events=[seed])
-    runner.wait(notification_id=position + 1, timeout=5)
+    position = dcb_app.events.append(events=[seed])
+    view.wait(
+        context_name=dcb_app.context_name,
+        notification_id=position + 1,
+        timeout=5,
+    )
     return seed
 ```
+
+**Wait on the view, not the runner.** `TrackingRecorder.wait`'s `interrupt` argument is
+optional, so the view synchronizes on its own — which matches production, where the
+supervisor keeps runners private. The `runner` fixture still appears in the signature:
+it is what must be *running* for the wait to ever succeed, even though nothing calls it.
 
 Three things reliably bite:
 
@@ -740,9 +882,9 @@ projection reads back — and `seed.uuid` is the value the emitted event's
 what makes that assertion possible:
 
 ```python
-def test_carries_causation(runner, trigger) -> None:
+def test_carries_causation(dcb_app, trigger) -> None:
     """The command names the trigger as its cause."""
-    emitted = ...  # read the appended event back off runner.app.events
+    emitted = ...  # read the appended event back off dcb_app.events.read()
     assert emitted.metadata["causation_id"] == str(trigger.uuid)
     assert emitted.metadata["correlation_id"] == "corr-1"
 ```
@@ -758,14 +900,15 @@ cross-entity isolation.
 
 **Prove the recovery paths against real infrastructure too.** This test applies to
 every automation, and it is the one case that must **not** use the `runner`
-fixture: build the view and app by hand, consume the position *before* any runner
-exists, then start one.
+fixture: it needs to consume the position *before* any runner exists, then start
+one — so it depends on `dcb_app` and `view` only.
 
 ```python
-def test_drain_recovers_an_orphaned_entry(entity_id: str) -> None:
+def test_drain_recovers_an_orphaned_entry(
+    dcb_app: {ProjectName}App, view: {SliceName}View, entity_id: str,
+) -> None:
     """An entry left outstanding by a crash is re-fired on restart."""
-    view, app = POPO{SliceName}View(), DcbApplication()
-    position = app.events.append(
+    position = dcb_app.events.append(
         events=[
             TaggedEvent(
                 decision={TriggerEventName}(entity_id=entity_id, field="value"),
@@ -776,15 +919,22 @@ def test_drain_recovers_an_orphaned_entry(entity_id: str) -> None:
     # A crashed run: entry and tracking committed, command never landed.
     view.add_entry(
         {EntryName}(entity_id=entity_id, field="value"),
-        Tracking(app.context_name, position),
+        Tracking(dcb_app.context_name, position),
     )
 
-    projection = {SliceName}Projection(view=view, command=...)
-    projection.drain()
-    with {SliceName}Runner(view=view, app=app, projection=projection) as runner:
-        runner.wait(notification_id=position + 1, timeout=5)
+    # create_runner() drains before subscribing, exactly as on a supervisor restart.
+    with create_runner(dcb_app, view):
+        view.wait(
+            context_name=dcb_app.context_name,
+            notification_id=position + 1,
+            timeout=5,
+        )
         assert view.get_entries() == []
 ```
+
+This is also the test that proves a **supervisor restart** recovers correctly: the
+restart path is precisely "call `create_runner(app, view)` again over the same view",
+and the fresh runner resumes at `max_tracking_id` rather than replaying from zero.
 
 **Seeding into a live runner's view raises `IntegrityError`.** The subscription
 processes that same event and calls `add_entry` with the same `Tracking`, so
@@ -798,24 +948,38 @@ For the retry loop — **only when the model has a failure event** — run a per
 failing command under a real runner and wait for `position + MAX_ATTEMPTS`, since each
 attempt appends one failure event.
 
+**Prove the loop actually closes over a shared store.** Drive the HTTP route that emits
+the trigger, then assert the automation's command landed — read the emitted event back
+off `dcb_app.events.read()`, or check the ledger drained. A privately-constructed
+application passes every seeded-event test above and fails this one, which is why it is
+worth writing.
+
 ---
 
 ## Files to create
 
 ```
+src/snake_case({ProjectName})/
+    projection.py                     # SharedAppProjectionRunner + ProjectionSupervisor (create ONLY if absent; never per-slice)
+
 src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/
     __init__.py
-    projection.py                     # view, projection, runner, create_runner
+    projection.py                     # view, projection, runner, create_view, create_runner
     slice.py                          # only if the model defines a failure event
 
 tests/acceptance/snake_case({Context})/snake_case({SliceName})/
     test_snake_case({SliceName}).py   # direct process_event calls, fake ports, drain()
 
 tests/integration/snake_case({Context})/
-    test_snake_case({SliceName}).py   # real runner, seeded events, wait(), recovery
+    test_snake_case({SliceName}).py   # shared app, seeded events, wait() on the view, recovery
 ```
 
 No `routes.py`. No `__init__.py` under `tests/`.
+
+`src/snake_case({ProjectName})/projection.py` is **shared runtime, not generated per
+slice** — it holds the one hand-written `__exit__` override that couples to private
+`BaseProjectionRunner` attributes, plus the supervisor every projection registers with.
+If it already exists, import from it and change nothing.
 
 The command slice under
 `src/snake_case({ProjectName})/snake_case({Context})/snake_case({CommandSliceName})/` is
@@ -833,6 +997,11 @@ The command slice under
 - [ ] The command call is wrapped in `try/except Exception` + `logger.exception(...)`
 - [ ] `_fire` takes `metadata: dict[str, str]`; every call site derives it (`_causation_metadata(envelope)`, or `{}` from `drain()`)
 - [ ] `drain()` implemented, and called in `create_runner()` **before** the runner is constructed
+- [ ] `{SliceName}Runner` subclasses `SharedAppProjectionRunner`, and sets `self.view` itself
+- [ ] `src/snake_case({ProjectName})/projection.py` exists (created only if absent — never per-slice)
+- [ ] `create_view()` and `create_runner(app, view)` are separate; the runner never constructs a `DcbApplication`
+- [ ] `create_runner(app, view)` is safe to call repeatedly over the same view — that is the supervisor's restart path
+- [ ] The lifespan enters the application **first** and the supervisor after it, both via `stack.enter_context`, and yields the view (never the runner)
 - [ ] Entries carry `attempts`; firing stops past `MAX_ATTEMPTS` and the entry stays parked
 - [ ] `get_entries()` takes no argument and returns copies, so callers cannot mutate view state
 - [ ] `add_entry` / `remove_entry` write the entry and its `Tracking` in one atomic step
@@ -841,7 +1010,7 @@ The command slice under
 - [ ] If the model has **no** failure event: no failure port, no third topic, no `_retry` branch — `drain()` alone is the recovery path
 - [ ] `correlation_id` carried forward (suppressed if absent); `causation_id` set to `str(envelope.uuid)`
 - [ ] Acceptance tests call `process_event` directly with strictly increasing tracking ids
-- [ ] Integration tests seed raw `TaggedEvent`s via `runner.app.events.append(...)`, and `wait()` on the returned position rather than sleeping
+- [ ] Integration tests seed raw `TaggedEvent`s through the **shared** application, and `view.wait(context_name=..., notification_id=position + 1, ...)` rather than sleeping
 - [ ] The seeded event carries every tag the command slice's boundary selects on
 - [ ] The `drain()` recovery test builds its own view and app, consuming the position **before** any runner is constructed
 - [ ] No `routes.py` created (automations are not exposed via HTTP)

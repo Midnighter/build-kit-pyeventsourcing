@@ -5,20 +5,22 @@ consumes events as they are recorded and updates a standalone read model. The
 FastAPI route only ever reads that model — it never touches the event store.
 Read this only after Step 1 of `SKILL.md` selected this approach.
 
-> **The central-application pattern does not apply here.** Command slices and
-> on-demand views share one process-wide `{ProjectName}App` (see `CLAUDE.md` →
-> *Application wiring*). `ProjectionRunner` instead takes an application
-> **class** and constructs its own instance (`application_class(env=env)`), so it
-> cannot be handed the shared instance. Keep the runner-owned application as
-> written below until that gap is closed separately.
+> **The central-application pattern applies here too.** Command slices, on-demand
+> views, materialized views and automations all share the one process-wide
+> `{ProjectName}App` (see `CLAUDE.md` → *Application wiring*). The stock
+> `ProjectionRunner` cannot be used, because it takes an application **class** and
+> constructs its own instance (`application_class(env=env)`) — under POPO that
+> private store is invisible to the routes doing the writing, so the view would
+> never update. Use `SharedAppProjectionRunner` from
+> `src/snake_case({ProjectName})/projection.py` instead, as Step 3 does.
 
 The projection is expressed as an `eventsourcing.projection.Projection`
 subclass whose `process_event(envelope, tracking)` mutates a
-`TrackingRecorder` (the materialized view). A `ProjectionRunner` wires a
-`DcbApplication`, the `Projection`, and the view's recorder class together,
-subscribes to the application in a background thread, and keeps the view's
-tracked position in sync. The FastAPI app starts the runner in its lifespan
-and hands the route a reference to `runner.view`.
+`TrackingRecorder` (the materialized view). A runner wires the **shared**
+`{ProjectName}App`, the `Projection`, and the view together, subscribes to the
+application in a background thread, and keeps the view's tracked position in
+sync. The FastAPI lifespan builds the view, registers a runner factory with the
+process-wide `ProjectionSupervisor`, and yields the **view** to the route.
 
 The view is a `TrackingRecorder`, and **which concrete recorder backs it is a
 deployment choice, not a design choice** — see *Choosing the view's backend*
@@ -27,17 +29,19 @@ backend you actually deploy; everything downstream (projection, route, tests)
 depends only on the interface.
 
 ```text
-DcbApplication.do(slice)                  (write side, unchanged)
+{ProjectName}App.do(slice)                (write side, unchanged — SHARED instance)
     │  records TaggedEvent
     ▼
-ProjectionRunner                          (background thread)
+{SliceName}Runner                         (background thread)
     │  subscribes via app.application_subscription(topics=...)
+    │  supervised: rebuilt over the same view if its thread dies
     ▼
 {SliceName}Projection.process_event(envelope, tracking)
     │  mutates the view and calls view.insert_tracking(tracking) exactly once
     ▼
 {SliceName}View (TrackingRecorder)        (the materialized state)
     │                                     backed by POPO or Postgres
+    │                                     outlives every runner
     ▼
 GET route reads {SliceName}View directly  (no event-store access)
 ```
@@ -62,19 +66,22 @@ DCB application:
 > and Postgres are the two supported options.
 
 You do not choose the backend by importing a different class at the call site.
-`ProjectionRunner` builds the view through
+`create_view()` (Step 3) builds the view through
 `InfrastructureFactory.construct(...).tracking_recorder(view_class)`, and the
 factory is resolved from the **`PERSISTENCE_MODULE` environment variable**. So:
 
-- The `view_class` you pass to `ProjectionRunner` must subclass the concrete
+- The `view_class` you pass to `create_view()` must subclass the concrete
   recorder matching the configured factory — a `POPOFactory` asserts
   `issubclass(view_class, POPOTrackingRecorder)`, `PostgresFactory` asserts
   `PostgresTrackingRecorder`. Passing the wrong pair fails at startup.
 - The environment is **name-scoped to `Projection.name`**. `Environment.get`
   tries `{NAME.upper()}_{KEY}` before the bare `{KEY}`, so
   `upper_snake_case({SliceName})_PERSISTENCE_MODULE` configures *this view* without
-  touching the `DcbApplication`'s own persistence. The view and the event store
+  touching the application's own persistence. The view and the event store
   can sit on different backends.
+- **`env` here scopes the view only.** The runner no longer constructs an
+  application, so the write side's `PERSISTENCE_MODULE` is configured once where
+  `{ProjectName}App` is created in `main.py` — not through this `env`.
 
 Default to **POPO only** unless the slice definition asks for durability. Write
 the Postgres implementation only when it is actually deployed — an unused
@@ -104,10 +111,17 @@ takes a `tracking` argument for.
 
 File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/projection.py`
 
-Four pieces live here: the view's abstract interface, its concrete
-implementation(s), the `Projection` that feeds it, and a small module-level
-`create_runner()` factory used by both the app lifespan (Step 7) and tests
-(Steps 5–6).
+Five pieces live here: the view's abstract interface, its concrete
+implementation(s), the `Projection` that feeds it, a `{SliceName}Runner`, and the
+module-level `create_view()` / `create_runner()` factories used by both the app
+lifespan (Step 7) and the tests (Steps 5–6).
+
+**The two factories are separate on purpose.** The view must be built exactly
+once — the route holds a reference to it through lifespan state, and the
+supervisor rebuilds the *runner* over that same view when a projection thread
+dies. If `create_runner()` also built the view, every restart would strand the
+route on a stale object. So `create_view()` is called once at startup;
+`create_runner(app, view)` may be called many times.
 
 Pick the consistency boundary as described under *Consistency boundary tags*
 in `SKILL.md`, but note that here it constrains the `topics` the subscription
@@ -118,17 +132,24 @@ type is in `topics`, and the view itself decides how to key its state
 background subscription cannot scope itself to "one entity").
 
 ```python
+import os
 from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
 
 from eventsourcing.domain import TaggedEvent
-from eventsourcing.persistence import Tracking, TrackingRecorder
+from eventsourcing.persistence import (
+    InfrastructureFactory,
+    Tracking,
+    TrackingRecorder,
+)
 from eventsourcing.popo import POPOTrackingRecorder
-from eventsourcing.projection import Projection, ProjectionRunner
-from eventsourcing.pydantic import Decision, DcbApplication
-from eventsourcing.utils import EnvType, get_topic
+from eventsourcing.projection import Projection
+from eventsourcing.pydantic import Decision
+from eventsourcing.utils import Environment, EnvType, get_topic
 
+from snake_case({ProjectName}).application import {ProjectName}App
+from snake_case({ProjectName}).projection import SharedAppProjectionRunner
 from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
 
 
@@ -207,24 +228,73 @@ class {SliceName}Projection(Projection[{SliceName}View, TaggedEvent[Decision]]):
                 self.view.insert_tracking(tracking)
 
 
-def create_runner(
+class {SliceName}Runner(SharedAppProjectionRunner):
+    """Runs the {SliceName} projection over the shared application."""
+
+    def __init__(
+        self,
+        view: {SliceName}View,
+        app: {ProjectName}App,
+        projection: {SliceName}Projection,
+    ) -> None:
+        """Subscribe the projection to the shared application."""
+        self.view = view
+        self.projection = projection
+        super().__init__(
+            projection=projection,
+            app=app,
+            tracking_recorder=view,
+            topics=projection.topics,
+        )
+
+
+def create_view(
     view_class: type[{SliceName}View] = POPO{SliceName}View,
     env: EnvType | None = None,
-) -> ProjectionRunner:
-    """Construct the {SliceName} projection runner (app + projection + view).
+) -> {SliceName}View:
+    """Build the {SliceName} materialized view.
 
-    Defaults to the in-memory view. Pass `view_class` plus a matching `env`
-    (see *Choosing the view's backend*) to materialize into Postgres instead.
+    Call this exactly once per process: the route depends on the object it
+    returns, and the supervisor rebuilds runners over it. Defaults to the
+    in-memory view; pass `view_class` plus a matching `env` (see *Choosing the
+    view's backend*) to materialize into Postgres instead.
     """
-    return ProjectionRunner(
-        application_class=DcbApplication,
-        projection_class={SliceName}Projection,
-        view_class=view_class,
-        env=env,
+    environment = Environment(
+        {SliceName}Projection.name,
+        {**os.environ, **(env or {})},
+    )
+    factory: InfrastructureFactory[{SliceName}View] = (
+        InfrastructureFactory.construct(env=environment)
+    )
+    return factory.tracking_recorder(view_class)
+
+
+def create_runner(
+    app: {ProjectName}App,
+    view: {SliceName}View,
+) -> {SliceName}Runner:
+    """Construct a runner feeding `view` from the shared application.
+
+    Safe to call repeatedly with the same `view`: a fresh runner resumes at
+    the view's `max_tracking_id`, which is how the supervisor restarts a dead
+    projection without replaying from zero.
+    """
+    return {SliceName}Runner(
+        view=view,
+        app=app,
+        projection={SliceName}Projection(view=view),
     )
 ```
 
 `EnvType` comes from `eventsourcing.utils` (it is just `Mapping[str, str]`).
+
+`{SliceName}Runner` sets `self.view` itself — `BaseProjectionRunner` only stores
+`self._tracking_recorder`; `self.view` was a `ProjectionRunner`-only attribute.
+
+The `Environment` + `InfrastructureFactory` lines are the one thing
+`ProjectionRunner` used to do for you. They are not incidental plumbing: naming
+the `Environment` after `{SliceName}Projection.name` is what activates the
+`upper_snake_case({SliceName})_PERSISTENCE_MODULE` scoping described above.
 
 ### Optional — a Postgres-backed implementation
 
@@ -296,21 +366,18 @@ which also passes a `tracking_table_name` derived from `Projection.name` and
 calls `create_table()` — so `__init__` must accept and forward `**kwargs`
 rather than fixing its own signature.
 
-To run against it, pass both the class and a matching environment. Note that
-`ProjectionRunner` hands the same `env` to **both** the `DcbApplication` and
-the view's factory, so it needs two `PERSISTENCE_MODULE` entries — the
-unprefixed one selects the DCB write-side backend, the prefixed one selects
-this view's:
+To run against it, pass the class and a matching environment to `create_view()`.
+This `env` reaches **only the view's** factory — the runner no longer builds an
+application, so the write side is configured where `{ProjectName}App` is
+constructed in `main.py`:
 
 ```python
-create_runner(
+create_view(
     view_class=Postgres{SliceName}View,
     env={
-        # Write side — the DCB event store. Its module is the dcb variant.
-        "PERSISTENCE_MODULE": "eventsourcing.dcb.postgres_tt",
         # Read side — this view only, prefixed with the projection name.
         "upper_snake_case({SliceName})_PERSISTENCE_MODULE": "eventsourcing.postgres",
-        # Connection settings, shared by both because they are unprefixed.
+        # Connection settings for the view's own recorder.
         "POSTGRES_DBNAME": "...",
         "POSTGRES_HOST": "...",
         "POSTGRES_USER": "...",
@@ -320,9 +387,14 @@ create_runner(
 ```
 
 Read these from the process environment (`os.environ`) in the app's lifespan —
-never hard-code credentials in the module. A durable view over an in-memory
-event store is not a useful configuration: on restart the store is empty and
-the view is stale forever, so move both sides together or neither.
+never hard-code credentials in the module.
+
+**Move the write side with it.** A durable view over an in-memory event store is
+not a useful configuration: on restart the store is empty and the view is stale
+forever. The write side's `PERSISTENCE_MODULE` (`eventsourcing.dcb.postgres_tt`)
+now belongs to `{ProjectName}App`'s own construction, so switching this view to
+Postgres means changing *both* places — they are no longer coupled through one
+`env` mapping the way `ProjectionRunner` coupled them.
 
 The repo's `compose.yaml` starts a PostgreSQL matching these settings
 (`docker compose up -d`), for manually exercising a durable view. It is
@@ -341,10 +413,13 @@ wildcard, and persisting `tracking` on every branch. Slice-specific points:
 
 - **`Projection.name` is the snake_case slice name**, so it lines up with the
   route and module naming used everywhere else in this skill.
-- **`create_runner()` defaults to the POPO view and `env=None`**, which needs
+- **`create_view()` defaults to the POPO view and `env=None`**, which needs
   no configuration at all. Both parameters exist so a deployment can swap in
   `Postgres{SliceName}View` from Step 7's lifespan without touching this
-  module; tests keep calling `create_runner()` bare.
+  module; tests keep calling `create_view()` bare.
+- **`create_runner()` takes the shared app and never constructs one.** That is
+  the whole point: a privately-constructed application gets its own POPO store,
+  so the view would never see the writes this slice exists to project.
 - **Keep `{SliceName}View` abstract and depend on it everywhere.** The
   projection is typed `Projection[{SliceName}View, ...]` and the route depends
   on `{SliceName}View`, never on a concrete recorder — that is what lets the
@@ -375,9 +450,14 @@ identical either way:
 File: `src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/routes.py`
 
 The route depends on the **view**, not the application — the whole point of
-materializing is that a query never touches the event store. The view
-instance is created once by the runner in the app's lifespan (Step 7) and
-handed to the route through `request.app.state`.
+materializing is that a query never touches the event store. The view is created
+once by `create_view()` in the app's lifespan (Step 7) and reaches the route
+through `request.state`, exactly like `get_application` reads
+`request.state.dcb_app`.
+
+It depends on the view rather than the runner for a second reason: the
+supervisor replaces runners on restart, so a route holding a runner reference
+could be left pointing at a dead one. The view is the stable object.
 
 ```python
 from typing import Annotated
@@ -396,8 +476,8 @@ router = APIRouter(
 
 
 def get_snake_case({SliceName})_view(request: Request) -> {SliceName}View:
-    """Return the {SliceName} view stored on the app by the projection lifespan."""
-    return request.app.state.snake_case({SliceName})_view
+    """Return the {SliceName} view populated by the projection lifespan."""
+    return request.state.snake_case({SliceName})_view
 
 
 class {EntryName}Response(BaseModel):
@@ -428,13 +508,14 @@ async def snake_case({SliceName})(
 
 Notes on the template:
 
-- **No `@lru_cache`'d app factory here.** There is nothing to cache — the
-  view is a long-lived object owned by the lifespan-managed `ProjectionRunner`,
-  not something a dependency function constructs per call.
-- **`request.app.state` is the seam integration tests override.** Step 6
-  builds a fresh `FastAPI()`, runs its own `ProjectionRunner` in the test's
-  lifespan, and lets the same `request.app.state` attribute flow through —
-  no `dependency_overrides` needed for the view itself.
+- **No `@lru_cache`'d app factory here.** There is nothing to cache — the view is
+  a long-lived object built once by the lifespan, not something a dependency
+  function constructs per call.
+- **`request.state`, never `request.app.state`.** The latter is a `State()` built
+  in `Starlette.__init__` that never receives lifespan state, so reading from it
+  raises `AttributeError` at request time (see `CLAUDE.md` → *Application
+  wiring*). Step 6 needs no `dependency_overrides` for the view: it runs against
+  the real app, whose lifespan populates this key.
 - Status codes follow the *Error mapping* table in `SKILL.md` — staleness
   (a write not yet caught up by the projection) is not distinguished from
   genuine absence; both read as 404. A request arriving before the runner's
@@ -520,52 +601,50 @@ def test_snake_case({SliceName})_reports_absent_when_no_events() -> None:
 
 ---
 
-## Step 6 — Integration tests (API-level, TestClient + ProjectionRunner)
+## Step 6 — Integration tests (API-level, against the real app)
 
 File: `tests/integration/snake_case({Context})/test_snake_case({SliceName}).py`
 
-These prove the FastAPI route, the lifespan-started `ProjectionRunner`, and
-the write path (writing through the same `DcbApplication` the runner
-subscribes to) work together end-to-end, including waiting for the
-background thread to catch up. Use `runner.wait(notification_id=..., timeout=...)`
-to synchronize deterministically — never `time.sleep`.
+These prove the FastAPI route, the lifespan-started runner, and the write path
+work together end-to-end, including waiting for the background thread to catch
+up.
+
+**Use the real `create_app()` via the shared `client` fixture** in
+`tests/integration/conftest.py` — never a local `FastAPI()` (see `CLAUDE.md` →
+*Test layout*). Once Step 7 wires this slice into the app's lifespan, that is
+also the only way to exercise the wiring you actually ship.
+
+Two things follow from the shared-application design:
+
+- **Seed through the app the runner subscribes to** — reach it with
+  `client.app_state["dcb_app"]`. There is no `runner.app` to seed through any
+  more, and appending anywhere else is invisible to the subscription.
+- **Wait on the view, not a runner.** The supervisor keeps runners private, and
+  `TrackingRecorder.wait`'s `interrupt` parameter is optional, so the view
+  synchronizes on its own. Never `time.sleep`.
 
 ```python
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
-
 import pytest
 from eventsourcing.domain import TaggedEvent
-from eventsourcing.projection import ProjectionRunner
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from snake_case({ProjectName}).application import {ProjectName}App
 from snake_case({ProjectName}).snake_case({Context}).events import {EventName}
-from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import create_runner
-from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).routes import router
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import (
+    {SliceName}View,
+)
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
-    """Return a TestClient whose lifespan runs a fresh ProjectionRunner."""
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        with create_runner() as runner:
-            app.state.snake_case({SliceName})_view = runner.view
-            app.state.snake_case({SliceName})_runner = runner
-            yield
-
-    app = FastAPI(lifespan=lifespan)
-    app.include_router(router)
-    with TestClient(app) as test_client:
-        yield test_client
+def dcb_app(client: TestClient) -> {ProjectName}App:
+    """Return the application opened by the real app's lifespan."""
+    return client.app_state["dcb_app"]
 
 
 @pytest.fixture
-def runner(client: TestClient) -> ProjectionRunner:
-    """Return the runner started by this app's lifespan."""
-    return client.app.state.snake_case({SliceName})_runner
+def view(client: TestClient) -> {SliceName}View:
+    """Return the materialized view built by the projection lifespan."""
+    return client.app_state["snake_case({SliceName})_view"]
 
 
 @pytest.fixture
@@ -575,15 +654,21 @@ def entity_id() -> str:
 
 
 @pytest.fixture
-def prior_thing(runner: ProjectionRunner, entity_id: str) -> {EventName}:
+def prior_thing(
+    dcb_app: {ProjectName}App, view: {SliceName}View, entity_id: str,
+) -> {EventName}:
     """Seed the fact this view projects, and wait for it to be projected."""
     decision = {EventName}(entity_id=entity_id, field1="a", field2=1)
-    position = runner.app.events.append(
+    position = dcb_app.events.append(
         events=[
             TaggedEvent(decision=decision, tags=[f"{{entity_kind}}:{entity_id}"]),
         ],
     )
-    runner.wait(notification_id=position, timeout=5)
+    view.wait(
+        context_name=dcb_app.context_name,
+        notification_id=position,
+        timeout=5,
+    )
     return decision
 
 
@@ -605,11 +690,11 @@ def test_snake_case({SliceName})_returns_projected_entries(
 
 
 def test_snake_case({SliceName})_isolates_other_entities(
-    client: TestClient, runner: ProjectionRunner,
+    client: TestClient, dcb_app: {ProjectName}App, view: {SliceName}View,
     prior_thing: {EventName}, entity_id: str,
 ) -> None:
     """Another entity's events do not leak into this entity's view."""
-    position = runner.app.events.append(
+    position = dcb_app.events.append(
         events=[
             TaggedEvent(
                 decision={EventName}(entity_id="entity-2", field1="b", field2=2),
@@ -617,12 +702,21 @@ def test_snake_case({SliceName})_isolates_other_entities(
             ),
         ],
     )
-    runner.wait(notification_id=position, timeout=5)
+    view.wait(
+        context_name=dcb_app.context_name,
+        notification_id=position,
+        timeout=5,
+    )
     response = client.get(f"/kebab-case({SliceName})/{entity_id}")
     assert response.json() == [
         {"field1": prior_thing.field1, "field2": prior_thing.field2},
     ]
 ```
+
+**Add one test proving the shared store is really shared** — drive a command
+route that emits `{EventName}`, then `GET` this view and assert the write shows
+up. That is the property a runner-owned application silently broke, and no
+seeded-event test can catch it.
 
 ### Integration-test notes
 
@@ -631,10 +725,10 @@ def test_snake_case({SliceName})_isolates_other_entities(
 `app.events.append(events=[...])`, and `wait()` over `time.sleep`.
 Slice-specific points:
 
-- **Seed raw `TaggedEvent`s through the runner's own application.** Unlike the
-  other suites, the events must go through `runner.app` — `ProjectionRunner`
-  constructs its own `DcbApplication` (see the note at the top of this file),
-  so events appended anywhere else are invisible to the subscription.
+- **Seed raw `TaggedEvent`s through the shared application.** The runner
+  subscribes to the application the lifespan opened, so that is the only store
+  whose appends it can see. Events appended to any other `DcbApplication`
+  instance are silently invisible under POPO.
 - **`append()` returns the position `wait()` needs.** That is the whole reason
   the seeding fixture can synchronize: append, then wait on what it returned.
   Never `time.sleep`.
@@ -654,86 +748,146 @@ Slice-specific points:
   id on the event body, but the tags still have to match what the real emitting
   slice would use, or the projection sees a history the rest of the system does
   not.
-- **The lifespan must stash the runner as well as the view.** The route only
-  needs `app.state.snake_case({SliceName})_view`, but the seeding fixture needs
-  `runner.app` to append through and `runner.wait` to synchronize — hence both
-  attributes in the fixture's lifespan.
-- **`create_runner()` is called bare here**, so both the `DcbApplication` and
-  the view stay in memory — no database, no env vars, no teardown beyond
-  exiting the `with` block. The route code exercised is identical to the
-  Postgres deployment's, because it depends on the abstract `{SliceName}View`.
+- **The lifespan yields the view, and the test reads it from
+  `client.app_state`.** Never reach for the runner: the supervisor owns it, may
+  replace it at any moment, and nothing a test needs lives on it. Both the
+  seeding target (`dcb_app`) and the synchronization point (`view`) come from
+  lifespan state.
+- **The whole stack stays in memory here** — `create_view()` defaults to POPO
+  and the app defaults to `eventsourcing.dcb.popo`, so there is no database, no
+  env vars, and no teardown beyond the `TestClient` `with` block. The route code
+  exercised is identical to the Postgres deployment's, because it depends on the
+  abstract `{SliceName}View`.
 
 ---
 
-## Step 7 — Wire the router and the runner lifespan into the FastAPI app
+## Step 7 — Wire the router, the view, and the supervisor into the FastAPI app
 
 The top-level FastAPI application is `src/snake_case({ProjectName})/main.py`.
 Unlike the other approaches, this one *does* touch its `lifespan`, because the
-`ProjectionRunner` has to start with the app — combine it with the existing
-lifespan using `AsyncExitStack` rather than overwriting it:
+view has to be built and its runner started with the app.
 
 ```python
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from functools import partial
 
 from fastapi import FastAPI
 
-from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import create_runner
-from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).routes import router as snake_case({SliceName})_router
+from snake_case({ProjectName}).application import {ProjectName}App
+from snake_case({ProjectName}).projection import ProjectionSupervisor
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import (
+    create_runner,
+    create_view,
+)
+from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).routes import (
+    router as snake_case({SliceName})_router,
+)
 
 
 @asynccontextmanager
-async def snake_case({SliceName})_lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Start the {SliceName} projection runner for the lifetime of the app."""
-    with create_runner() as runner:
-        app.state.snake_case({SliceName})_view = runner.view
-        yield
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Combine every slice's lifespan under one AsyncExitStack."""
+async def lifespan(_app: FastAPI) -> AsyncIterator[dict[str, object]]:
+    """Open the application and every supervised projection for the app's life."""
     async with AsyncExitStack() as stack:
-        await stack.enter_async_context(snake_case({SliceName})_lifespan(app))
-        # await stack.enter_async_context(other_slice_lifespan(app))
-        yield
+        dcb_app = stack.enter_context({ProjectName}App())
+        supervisor = ProjectionSupervisor(context_name=dcb_app.context_name)
+
+        snake_case({SliceName})_view = create_view()
+        supervisor.register(
+            "snake_case({SliceName})",
+            snake_case({SliceName})_view,
+            partial(create_runner, dcb_app, snake_case({SliceName})_view),
+        )
+        # supervisor.register("other_slice", other_view, partial(...))
+
+        stack.enter_context(supervisor)
+        yield {
+            "dcb_app": dcb_app,
+            "snake_case({SliceName})_view": snake_case({SliceName})_view,
+            "projection_supervisor": supervisor,
+        }
 
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(snake_case({SliceName})_router)
 ```
 
+Details that are load-bearing rather than stylistic:
+
+- **`stack.enter_context`, not `enter_async_context`.** Both `{ProjectName}App`
+  and `ProjectionSupervisor` are *sync* context managers. `AsyncExitStack`
+  handles both kinds; picking the wrong method fails at startup.
+- **Enter order is the teardown contract.** The application goes in **first** so
+  it closes **last** — every runner must be stopped before the store it reads
+  from is closed. The supervisor goes in after it and therefore exits before it.
+- **One supervisor per process, shared by every slice.** Adding a second
+  materialized slice adds a `create_view()` + `register(...)` pair and one more
+  key in the yielded mapping — never a second supervisor, and never a second
+  application.
+- **`register()` before `enter_context(supervisor)`.** Entering is what
+  constructs and starts the runners; registering afterwards would leave the
+  projection unsupervised.
+- **`partial(create_runner, dcb_app, view)` is the restart factory.** The
+  supervisor calls it again for each restart, always against the same view, so
+  the new runner resumes at `max_tracking_id` (see `CLAUDE.md` → *Supervising
+  projections*).
+- **The lifespan yields the view, never the runner** — the supervisor swaps
+  runners, so a reference held elsewhere could point at a dead one.
+
+If a top-level app already exists (it normally does — the command slices need
+one), add the three lines for this slice to its existing lifespan rather than
+writing a new function: `create_view()`, `supervisor.register(...)`, and one
+key in the yielded mapping. Create `supervisor` and the `AsyncExitStack` only if
+this is the first projection in the project.
+
+### Choosing a durable backend
+
 **This lifespan is the one place the backend is chosen.** The bare
-`create_runner()` above materializes into memory, which is the right default —
-and correct for a single-process deployment that can afford to rebuild on
-restart. If the slice needs a durable view, this is the only line that changes:
+`create_view()` above materializes into memory, which is the right default and
+correct for a single-process deployment that can afford to rebuild on restart.
+For a durable view, pass the view class and its env:
 
 ```python
-    with create_runner(
-        view_class=Postgres{SliceName}View,
-        env={
-            "PERSISTENCE_MODULE": "eventsourcing.dcb.postgres_tt",
-            "upper_snake_case({SliceName})_PERSISTENCE_MODULE": "eventsourcing.postgres",
-            # POSTGRES_DBNAME / HOST / USER / PASSWORD from os.environ
-        },
-    ) as runner:
+        snake_case({SliceName})_view = create_view(
+            view_class=Postgres{SliceName}View,
+            env={
+                "upper_snake_case({SliceName})_PERSISTENCE_MODULE": "eventsourcing.postgres",
+                # POSTGRES_DBNAME / HOST / USER / PASSWORD from os.environ
+            },
+        )
 ```
 
-`ProjectionRunner` passes this `env` to the `DcbApplication` as well as to the
-view's factory, so both sides move to Postgres together — which is what you
-want, since a durable view over an in-memory event store goes permanently stale
-on the first restart.
+**The write side moves separately now.** `create_view()`'s `env` scopes the view
+only; the event store's `PERSISTENCE_MODULE` is configured where
+`{ProjectName}App` is constructed. Move both together — a durable view over an
+in-memory event store goes permanently stale on the first restart, and the two
+are no longer coupled through a single `env` the way they were when the runner
+built its own application.
 
 Nothing in `routes.py`, the projection, or either test suite is touched — they
 all depend on the abstract `{SliceName}View`. Do not add this unless the slice
 definition calls for durability.
 
-If no top-level app exists yet, create it with just this one slice's lifespan
-entered into the `AsyncExitStack` — the shape stays the same as more slices
-are added later, each contributing one more `stack.enter_async_context(...)`
-line. If a top-level app already exists with its own `lifespan`, add this
-slice's context manager as one more `stack.enter_async_context(...)` call
-inside it rather than replacing the function.
+### Reporting projection health
+
+If the project has a `/healthz` route, have it report terminal projection
+failure — the supervisor has already given up restarting by then:
+
+```python
+@app.get("/healthz")
+async def healthz(request: Request) -> dict[str, str]:
+    """Report whether every supervised projection is still running."""
+    failures = request.state.projection_supervisor.failures()
+    if failures:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={name: str(error) for name, error in failures.items()},
+        )
+    return {"status": "ok"}
+```
+
+**It reports; it never restarts.** Recovery is the supervisor's job, so health
+checks stay free of side effects (see `CLAUDE.md` → *Supervising projections*).
 
 ---
 
@@ -748,24 +902,29 @@ inside it rather than replacing the function.
   are the two options for a DCB application. Declare an abstract
   `{SliceName}View` and let the projection, route, and tests depend only on
   that, so swapping backends touches one line in the app lifespan.
-- **`ProjectionRunner` resolves the recorder from the environment**, not from
-  the import. `upper_snake_case({SliceName})_PERSISTENCE_MODULE` selects the factory
+- **`create_view()` resolves the recorder from the environment**, not from the
+  import. `upper_snake_case({SliceName})_PERSISTENCE_MODULE` selects the factory
   for *this view*; the `view_class` passed in must subclass the matching
-  concrete recorder or startup fails an assertion.
+  concrete recorder or construction fails an assertion.
+- **The runner subscribes to the shared application; it never builds one.**
+  `ProjectionRunner` takes an application *class* and instantiates it, which
+  would give the projection a private store the command routes cannot write
+  to — so this skill uses `SharedAppProjectionRunner` instead (see `CLAUDE.md`
+  → *Projection runners*).
 - **Entry and tracking must be written atomically** — under
   `self._database_lock` for POPO, inside one `datastore.transaction(commit=True)`
   for Postgres. This is why `add_entry` takes the `Tracking`.
-- **The route depends on the view object, not on the application or the
-  runner.** The runner (and its write-side `DcbApplication`) exist only to
-  keep the view current in the background; the route never imports
-  `ProjectionRunner`.
+- **The view is the stable identity; the runner is disposable.** The supervisor
+  rebuilds runners over the same view, so the view is what the lifespan yields,
+  what the route depends on, and what tests `wait()` on. Nothing outside the
+  supervisor holds a runner reference.
 - **Entity keying is application-level, not DCB-level.** A background
   subscription cannot scope itself to one entity, so the view keys its own
   state by an id carried on the event body — there is no per-query replay
   boundary the way there is in the on-demand approach.
 - **In-memory testing, whatever the deployment backend.**
   `POPOTrackingRecorder`/`POPOApplicationRecorder` need no environment
-  configuration — one fresh `ProjectionRunner` per test (Step 6) or one fresh
+  configuration — the real app's lifespan per test (Step 6) or one fresh
   view+projection pair with no runner at all (Step 5), no cleanup needed
   beyond exiting the `with` block. Tests never require a database.
 
@@ -774,14 +933,23 @@ inside it rather than replacing the function.
 ## Files to create
 
 ```
+src/snake_case({ProjectName})/
+    projection.py                                         # SharedAppProjectionRunner + ProjectionSupervisor (create ONLY if absent; never per-slice)
 src/snake_case({ProjectName})/snake_case({Context})/
     events.py                                             # shared event Decisions (add new types here; do not remove existing ones)
 src/snake_case({ProjectName})/snake_case({Context})/snake_case({SliceName})/
     __init__.py                                           # package marker
-    projection.py                                         # View interface + POPO impl (+ Postgres impl only if deployed) + Projection + create_runner()
-    routes.py                                             # FastAPI router reading the view from app.state
+    projection.py                                         # View interface + POPO impl (+ Postgres impl only if deployed) + Projection + Runner + create_view() + create_runner()
+    routes.py                                             # FastAPI router reading the view from request.state
 tests/acceptance/snake_case({Context})/snake_case({SliceName})/
     test_snake_case({SliceName}).py                       # projection-level tests (direct process_event calls, no runner)
 tests/integration/snake_case({Context})/
-    test_snake_case({SliceName}).py                       # API-level tests (TestClient + lifespan-started ProjectionRunner)
+    test_snake_case({SliceName}).py                       # API-level tests (real create_app(), seed through the app, wait on the view)
 ```
+
+`src/snake_case({ProjectName})/projection.py` is **shared runtime, not generated
+per slice** — it holds the one hand-written `__exit__` override that couples to
+private `BaseProjectionRunner` attributes, plus the supervisor every projection
+registers with. If it already exists, import from it and change nothing; if it
+does not, create it once (see `CLAUDE.md` → *Projection runners* and
+*Supervising projections* for exactly what it must guarantee).
