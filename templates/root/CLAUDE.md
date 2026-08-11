@@ -2,6 +2,8 @@
 
 Conventions and gotchas that apply to every file in this repo. Skills should describe **what** to build; this file records **how** to keep it committable.
 
+Placeholders below follow the build skills: `{ProjectName}` is `[project] name` in `pyproject.toml`, and `snake_case({ProjectName})` is the single top-level package under `src/` — confirm it on disk rather than deriving it.
+
 ## Tooling
 
 - **hatch** manages every Python environment. Never call `python`/`pip`/`pytest` directly — use `hatch -e dev run <cmd>` or `hatch -e dev shell`. Each test suite has its own env: `unit-tests`, `acceptance-tests`, `integration-tests`, `documentation-tests`.
@@ -12,7 +14,7 @@ Conventions and gotchas that apply to every file in this repo. Skills should des
 
 Every new Python module must satisfy these before it can be committed:
 
-- **Copyright header** on line 1: `# Copyright {YYYY} Moritz E. Beber` (ruff `CPY001`).
+- **Copyright header** on line 1: `# Copyright {YYYY} {ProjectAuthor}` (ruff `CPY001`), where `{ProjectAuthor}` is the `name` from `[project] authors` in `pyproject.toml` — copy the exact spelling already used by existing modules.
 - **Module docstring** immediately after the header (`D100`).
 - **Class docstring** on every public class (`D101`).
 - **Method/function docstring** on every public callable (`D102`, `D103`, `D104` for packages).
@@ -25,17 +27,37 @@ Every new Python module must satisfy these before it can be committed:
 
 - **Depend on `Annotated[T, Depends(...)]`, not `T = Depends(...)`.** The old form trips `FAST002` and `B008`.
 - **Pydantic model fields need runtime type imports.** `from __future__ import annotations` + PEP 563 is fine for everything *except* types that appear as `BaseModel` fields — Pydantic can't rebuild the schema when the class is under `TYPE_CHECKING`. Import such types at runtime and silence `TC003` with a `# noqa: TC003` comment on that specific line.
-- **`lru_cache`'d dependency factories persist across tests.** Integration tests must override them via `app.dependency_overrides[get_x] = lambda: fresh_x`; otherwise state leaks between test cases.
+- **Dependency factories read from `request.state`, never `lru_cache`.** `get_application` (state-change / on-demand views) and per-slice view getters such as `get_snake_case({SliceName})_view` (materialized views) read the object the lifespan already yielded into `request.state` — they don't construct or cache anything themselves. `lru_cache` has no teardown hook and would pin the first test's instance across every later test; since nothing here uses it, integration tests need no `dependency_overrides` at all.
+- **A dependency's parameter types must be importable at runtime.** `def get_application(request: Request)` with `Request` under `TYPE_CHECKING` makes FastAPI fail to resolve the annotation and silently treat `request` as a *query parameter* — every call then 422s with `{'loc': ['query', 'request'], 'msg': 'Field required'}`. Import such types at runtime and silence `TC002` with a `# noqa` on that line, same as for Pydantic field types.
+
+## Observability
+
+OpenTelemetry covers three seams the library gives no help with: the command path, the event store, and the projection threads — where a failure is silent by construction (a dead processing thread leaves a view quietly stale). All four hooks below are plain public methods or attributes; **nothing here monkeypatches the library.**
+
+- **`src/snake_case({ProjectName})/telemetry.py` is shared runtime — create ONLY if absent, never per-slice.** Same rule as `projection.py`. Its contract:
+  - `configure_telemetry()` — idempotent; called once from `create_app()`. Installs an SDK **only** when `OTEL_EXPORTER_OTLP_ENDPOINT` is set and `OTEL_TRACES_EXPORTER` is not `none`. Honour the standard `OTEL_*` variables; do not invent project-specific ones.
+  - `command_span(slice_)` — used by `{ProjectName}App.do`.
+  - `consumer_span(envelope, name)` — used by `Projection.process_event`.
+  - `instrument_recorder(app)` — wraps `app.recorder.append`/`.read` at the instance level. Call it **after** `{ProjectName}App()` is constructed; `recorder` is set in `__init__`.
+- **Off by default, and that is a no-op tracer, not a cheat.** With no endpoint configured no `TracerProvider` is ever installed and `get_tracer()` returns a proxy to `NoOpTracer` — no exporter threads, no network, no I/O. It is *not* literally free: every no-op span still does one `contextvars` attach/detach. Cheap enough to leave in hot paths, not cheap enough to claim "zero overhead".
+- **`application.py` gains exactly one override: `do()`.** This is the single documented exception to *"`application.py` is never edited"* — and it is written **once**, not per slice. Adding a slice still touches `main.py` only.
+- **Trace context travels in `TaggedEvent.metadata`, via `put_metadata_in_context`** — never by mutating events one at a time. `metadata` defaults from a contextvar, so every event constructed inside that block inherits the `traceparent` automatically, and it round-trips through the store (a `jsonb` column under Postgres) to reach the consumer.
+- **Only write `traceparent` when the carrier is non-empty after `inject()`.** Under a no-op tracer the span context is invalid and `inject()` writes nothing; don't turn that into a `{"traceparent": None}` entry.
+- **On extract, guard `span_ctx.is_valid` before building a `Link`.** Events written while telemetry was off carry no traceparent, and events replayed by `drain()` may link to traces already outside the retention window — neither is a bug.
+- **`process_event` spans are links, never children.** Two independent reasons: the producing span ended long before (often minutes), and `BaseProjectionRunner`'s processing thread is a bare `threading.Thread`, which does **not** inherit contextvars — so ambient propagation is not merely wrong here, it is impossible. Use `SpanKind.CONSUMER` with a `Link`, per the OTel messaging conventions for temporally decoupled producers and consumers.
+- **Instrumentation must never swallow an exception.** A span context manager that suppresses is the blanket `try/except` around `process_event` wearing a different hat: it advances past a poison event and diverges the view from the log permanently while `/healthz` still reports 200. Record the exception on the span and **re-raise**, so the supervisor still sees the thread die.
+- **Guard `None` in metrics.** `recorder.head()` and `max_tracking_id()` both return `int | None`. Before a projection has processed anything its lag is *undefined*, not zero — skip the observation rather than reporting a fake backlog.
+- **The SDK belongs to the `telemetry` extra, and the `dev` env alone.** The test suites deliberately do not install it, so they exercise the no-op path. Don't add it to a test env to assert on spans; construct an in-memory provider inside the test instead.
 
 ## Test layout
 
 - **No `__init__.py` under `tests/`.** Pytest doesn't need it; adding them is unwanted clutter.
 - **`@pytest.fixture`** — no parentheses (`PT001`).
-- **`tests/acceptance/`** — slice-level tests using `eventsourcing.dcb.gwt` (given/when/then over an in-memory `DcbApplication`).
-- **`tests/integration/`** — API-level tests using `fastapi.testclient.TestClient` against a fresh `FastAPI()` per test.
+- **`tests/acceptance/`** — for `Slice`-based slices (state-change, on-demand view), given/when/then tests using `eventsourcing.dcb.gwt`. For `Projection`-based slices (automation, materialized view), GWT cannot drive a `Projection`: construct the view and projection directly and call `process_event` yourself — no `DcbApplication`, no runner, no background thread.
+- **`tests/integration/`** — API-level tests using `fastapi.testclient.TestClient` against the real `create_app()`, via the shared `client` fixture in `tests/integration/conftest.py`. Never build a local `FastAPI()`: testing the real app is what catches route-prefix collisions between slices.
 - **`tests/unit/`** and **`tests/documentation/`** — reserved for their respective purposes; a placeholder test must exist in each so pytest doesn't exit with code 5.
-- **`with TestClient(app) as client:`, not a bare `TestClient(app)`,** whenever the app defines a `lifespan`. The `with` block is what drives the lifespan context manager; without it nothing set on `app.state` during startup exists and every route raises `AttributeError`.
-- **Never `time.sleep` to wait for a background thread.** `TrackingRecorder.wait(context_name, notification_id, timeout)` and `ProjectionRunner.wait(notification_id, timeout)` exist for this. They block the calling thread, not the event loop — safe to call from a sync test against an async app.
+- **`with TestClient(app) as client:`, not a bare `TestClient(app)`,** whenever the app defines a `lifespan`. The `with` block is what drives the lifespan context manager; without it the state the lifespan yields never exists and every route raises `AttributeError` on `request.state.dcb_app`.
+- **Never `time.sleep` to wait for a background thread.** `TrackingRecorder.wait(context_name, notification_id, timeout)` exists for this — call it on the **view**, never on a runner (the supervisor may already have replaced it). It blocks the calling thread, not the event loop — safe to call from a sync test against an async app.
 - **Integration tests need `httpx2`** in the `integration` dependency group and a matching `integration-tests` hatch env.
 
 ## pyeventsourcing DCB API quick reference
@@ -48,6 +70,37 @@ Every new Python module must satisfy these before it can be committed:
 - **`Selector(types=[], tags=[])` is not "no boundary" — it is "fail if *any* event exists anywhere."** An empty selector is a DCB append condition over the whole store, so two writes for unrelated entities in the same test collide with `IntegrityError`. Always scope `types`/`tags` to the entity, including in test-only emitting slices.
 - **`repository.save(slice_)` returns the `int` append position** — the same value `TrackingRecorder.wait` polls via `max_tracking_id`. Don't try to read it off `slice_.new_decisions`; `collect_events()` drains that list during `save()`.
 
+### Application wiring
+
+- **One `{ProjectName}App` per process**, created by the FastAPI lifespan in `src/snake_case({ProjectName})/main.py`; slices never subclass `DcbApplication`. Separate `DcbApplication()` instances each get their own in-memory store (`PERSISTENCE_MODULE` defaults to `eventsourcing.dcb.popo`), so per-slice applications silently cannot see each other's events — an event written through one endpoint would be invisible to the next.
+- **The lifespan *yields* `{"dcb_app": app}`; `get_application` reads `request.state.dcb_app`.** Starlette merges the yielded mapping into the lifespan scope state and shallow-copies it into every request scope, so handlers can't clobber it. Do not assign to `app.state` — it is a different object that never receives lifespan state.
+- **`DcbApplication` is a context manager.** Hold it with `with`, never `lru_cache` — the latter has no teardown hook, so `close()` (and, under Postgres, the connection-pool teardown) never runs.
+- **Adding a slice touches `main.py` only** — one router import plus one `include_router` line. `application.py` is never edited *by a slice*, because `do()` is generic over any `Slice`. (The one process-wide `do()` override for tracing is written once and is not a per-slice edit — see *Observability*.)
+- **Materialized views and automations use the shared application too.** They are *not* exempt. `ProjectionRunner` takes an application *class* and constructs its own instance, so it is unusable here — see *Projection runners* below for what to use instead.
+
+### Projection runners
+
+Runners are **threads in the API process**. This is not a design choice: the library ships no multiprocessing runner, and POPO subscriptions are strictly process-local (`POPOApplicationRecorder` keeps listeners as `threading.Event` objects in process memory). Cross-process subscription is possible only on Postgres via `LISTEN`/`NOTIFY`, and nothing implements it.
+
+- **Never let a runner construct its own application.** `ProjectionRunner` calls `application_class(env=env)` internally, giving it a private store; under POPO that store is invisible to the routes writing through `{ProjectName}App`, so the view never updates and an automation never sees its trigger. Use `BaseProjectionRunner`, which takes an already-constructed `app`.
+- **`BaseProjectionRunner.__exit__` unconditionally calls `self.app.close()`,** with no flag or hook to prevent it. `SharedAppProjectionRunner` in `src/snake_case({ProjectName})/projection.py` overrides `__exit__` wholesale to drop that one call. Under POPO `close()` is a no-op so the bug is invisible; on Postgres it closes a connection pool that **cannot be reopened** (`PoolClosed` on every later request).
+- **That override reaches into four private attributes** (`_stop_thread`, `_subscription`, `_processing_thread`, `_thread_error`) of an alpha library. It lives in exactly one hand-written module so a version bump has one place to audit, and `tests/unit/test_projection.py` asserts the app survives a runner exit — that test is the upgrade tripwire.
+- **Constructing a runner starts it.** `__init__` subscribes at `gt=tracking_recorder.max_tracking_id(...)` and starts both threads; `__enter__` only enters the subscription. There is no deferred start.
+- **The view is the stable identity, not the runner.** Restarts replace the runner but keep the view, so the view is what goes in lifespan state, what routes depend on, and what tests `wait()` on. Build it once with `create_view()`; `create_runner(app, view)` may be called repeatedly.
+- **Lifespan ownership**: the application is entered **first** so it closes **last**; the supervisor is entered after it and torn down before it. Both are *sync* context managers — use `AsyncExitStack.enter_context`, not `enter_async_context`.
+
+### Supervising projections
+
+One unhandled exception in `process_event` **permanently kills** the processing thread — no retry, no restart — and the error stays hidden in `_thread_error` until the next `wait()`/`run_forever()`/`__exit__`. Left alone, that is a silently stale view.
+
+- **One process-wide `ProjectionSupervisor`** owns a single watchdog thread over every registered projection. It probes with `run_forever(timeout=0)` (non-blocking; re-raises the stored error) and rebuilds dead runners via the registered factory.
+- **A restart resumes where the dead runner stopped.** Tracking is committed atomically with each view mutation, so a fresh runner over the same view subscribes at `max_tracking_id` — no loss, no replay from zero.
+- **Count restarts by position, not by count.** If `max_tracking_id` advanced since the last death the projection made progress, so reset the counter; unchanged means the same poison event, so increment. Without this, unrelated transient faults accumulate and eventually stop a healthy projection for good.
+- **Past `max_restarts`, stop and report.** The runner stays dead and surfaces in `supervisor.failures()`, which `/healthz` turns into a 503. A view frozen at a known position is honest; one that skipped an event is silently wrong forever.
+- **Do not wrap `process_event` in a blanket `try/except`.** Swallowing an event and advancing past it diverges the view from the log permanently while health checks still report 200. Automations keep their targeted guard around the *command port* (`_fire`), where the lingering ledger entry is itself the signal.
+- **The watchdog is a thread, not an asyncio task,** because tearing a runner down makes two unbounded `Thread.join()` calls and may block on a dead database socket. On the event loop that would stall every request; on a thread it degrades one projection.
+- **`/healthz` reports; it never restarts.** Recovery is the supervisor's job, so health checks stay free of side effects.
+
 ### Projections (materialized views)
 
 - **`Projection.topics` is a tuple of topic strings** (`get_topic(EventClass)`), not `Selector` instances. It filters what the subscription pulls before `process_event` is called.
@@ -59,5 +112,15 @@ Every new Python module must satisfy these before it can be committed:
 ### Testing DCB code
 
 - GWT test helpers: `given(*TaggedEvent).when(slice_instance).then(*TaggedEvent)`. `then` compares `TaggedEvent` instances, not classes.
+- **`then(*expected)` only compares `.decision` and `.tags`** — it deliberately ignores the auto-generated `.uuid` field on each `TaggedEvent`. A raw `assert when.collected == [...]` does full dataclass equality *including* `.uuid` and spuriously fails even when decision/tags match. Always assert via `.then(...)`, not raw equality. If a test needs a field the slice generates itself (e.g. a timestamp), read it off `when.collected[0].decision.<field>` and feed it into the expected event.
 - **`given`/`when` only drive `Slice` objects** — they dispatch through `@event`-decorated handlers on the object passed to `when()`. A `Projection` is driven by `process_event` instead, so test it by constructing the view and projection directly and calling `process_event(envelope, Tracking(context_name, notification_id))` yourself. No runner, no background thread.
+- **Seed integration histories with `app.events.append(events=[...])`, not by driving other slices.** Passing raw `TaggedEvent`s keeps a slice's tests independent of other slices' validation rules, and permits histories a slice would legitimately refuse to emit. Omit `cb`/`after` to get an unconditional append (`DcbEventStore.append` builds a `DcbAppendCondition` only when one is given). Tags must still satisfy Selector tags ⊆ trigger tags, or the seeded events are silently invisible to the slice under test.
+- **This applies to runner-driven suites too** (materialized views, automations), where it replaces the older test-only emitting `Slice`. Seed through the **shared `{ProjectName}App`** the runner subscribes to — not through `runner.app`, which only worked when runners owned a private store. Two further gains over a `Slice`-based seed: `append()` returns the `int` position to pass straight to `wait()`, and because the append is unconditional, repeated seeds into the same entity's tags all succeed — no `repository.advance()` replay, no `IntegrityError`, and no `execute()`-before-`save()` step.
+- **Wait on the *view*, not the runner.** `TrackingRecorder.wait(context_name, notification_id, timeout)` takes an optional `interrupt`, so a test needs no runner reference: `view.wait(context_name=app.context_name, notification_id=position, timeout=5)`. This matches production, where the supervisor keeps runners private and only views reach routes. It raises `TimeoutError` on expiry. Automations still wait on `position + 1` to cover the command's own emitted event.
+- **`TaggedEvent.metadata` and `.uuid` round-trip through the store**, so a seed can set `metadata={"correlation_id": ...}` and the projection reads it back off the envelope. Returning the seeded `TaggedEvent` (not just its `Decision`) is what lets a test assert an emitted event's `causation_id == str(seed.uuid)`.
+- **Never write into a live runner's view from the test thread.** Calling `view.add_entry(entry, Tracking(app.context_name, position))` while a runner is subscribed races the subscription, which processes the same event and inserts the same `Tracking` — whichever write loses trips `IntegrityError` on the background thread, surfacing later out of `wait()` rather than at the call site. To simulate a crash, consume the position *before* any runner exists, then start one; that is also the faithful ordering, and why `drain()` runs before the runner is constructed.
+- **`app.events.read()` returns an iterator of `TaggedEvent`s**, not an object with an `.envelopes` attribute. Iterate it directly to assert on recorded events.
+- **Each seeded fact is a fixture, declared in the test signature** — not a helper called from the test body. Fixtures compose (a richer history depends on a simpler one), ids get their own fixtures so arrangement and request body share one value, and each returns its `Decision` so the test can assert against what it arranged. This also makes ordering structural: pytest resolves the graph before the body runs.
+- **`repository.save()` is not a seeding API** — it takes a `Perspective` and derives an append condition from its `consistency_boundary()`/`last_known_position`. `app.events` is the `DcbEventStore`; that is the seeding primitive.
+- **Reach the app under test via `client.app_state["dcb_app"]`**, not `client.app.state` — the latter is a `State()` built in `Starlette.__init__` that never receives lifespan state and raises `AttributeError`.
 - **GWT refuses histories outside the consistency boundary.** Prior events on `given()` must carry tags overlapping the slice's `consistency_boundary()`, or `when()` raises `AssertionError("Consistency boundary wouldn't have selected: ...")`. This is deliberate — but it means cross-entity isolation ("another entity's events don't leak into this one") can't be proven at the acceptance level. That property belongs in the integration suite.
