@@ -139,6 +139,7 @@ All environments inheriting from the default also inherit the configuration valu
 here.
 """
 type = "pip-compile"
+lock-filename = "requirements/requirements-{env_name}.txt"
 pip-compile-constraint = "dev"
 pip-compile-hashes = true
 pip-compile-resolver = "uv"
@@ -158,6 +159,11 @@ features = ["telemetry"]
 
 [tool.hatch.envs.dev.env-vars]
 PYTHONDEVMODE = "1"
+
+[tool.hatch.envs.production]
+description = """Production environment."""
+lock-filename = "requirements.txt"
+features = ["telemetry"]
 
 [tool.hatch.envs.style]
 description = """Check the style of the codebase."""
