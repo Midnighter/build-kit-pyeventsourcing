@@ -15,7 +15,7 @@ The structure defined in the Project-Skills is relevant.
    <promise>NO_TASKS</promise> and stop immediately. Do not work on other slices.
 6. Pick the slice definition from `.build-kit/.slices/<contextName>/<folder>/slice.json` as defined in the prd. Never work on more than one slice per iteration.
 7. A slice can define additional prompts as codegen/backendPrompt. any additional prompts defined in backend are hints for the implementation of the slice and have to be taken into account. If you use the additional prompt, add a line in progress.txt
-7. Determine the slice type and invoke the matching skill as defined in the **Building a Slice** section of CLAUDE.md. Do NOT implement manually.
+7. Determine the slice type and invoke the matching skill as defined in the **Building a Slice** section of `.build-kit/CLAUDE.md`. Do NOT implement manually. Each of those skills starts with a **Step 0** that verifies the project's shared runtime — do not skip it.
 8. Write a short progress one liner after each step to progress.txt
 9. Analyze and Implement that single slice, make use of the skills in the skills directory, but also your previsously collected
    knowledge. Make a list TODO list for what needs to be done. Also make sure to adjust the implementation according to the json definition. Carefully inspect events, fields and compare against the implemented slice. JSON is the desired state. ATTENTION: A "planned" task can also be just added specifications. So always look at the slice itself, but also the specifications. If specifications were added in json, which are not on code, you need to add them in code.
