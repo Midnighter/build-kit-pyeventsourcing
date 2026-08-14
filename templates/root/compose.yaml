@@ -1,0 +1,56 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.development
+    container_name: TODO
+    environment:
+      SUBSCRIPTIONS_PERSISTENCE_MODULE: "eventsourcing_umadb"
+      UMADB_URI: "http://eventstore:50051"
+      OTEL_SERVICE_NAME: TODO
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://observability:4317
+      PERSISTENCE_MODULE: "eventsourcing.postgres"
+      POSTGRES_DBNAME: projections
+      POSTGRES_HOST: projections
+      POSTGRES_USER: TODO
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      projections:
+        condition: service_healthy
+      observability:
+        condition: service_started
+      eventstore:
+        condition: service_started
+
+  eventstore:
+    image: umadb/umadb:0.7.5
+    container_name: TODO-eventstore
+    command: ["--listen", "0.0.0.0:50051", "--db-path", "/data"]
+    volumes:
+      - ./eventstore:/data
+
+  projections:
+    image: postgres:17.10-alpine
+    container_name: TODO-projections
+    environment:
+      POSTGRES_DB: projections
+      POSTGRES_USER: TODO
+      POSTGRES_PASSWORD: secret
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U TODO -d projections"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+    volumes:
+      - ./projections/pgdata:/var/lib/postgresql/data
+
+  observability:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.20.0
+    container_name: TODO-observability
+    ports:
+      - "16686:16686"
