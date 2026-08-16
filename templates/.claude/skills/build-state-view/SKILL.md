@@ -49,7 +49,8 @@ A slice is built *on* the shared runtime; it never carries a copy of it. Before 
 | `main.py` | ditto — including `configure_telemetry()`, `instrument_app()`, `instrument_recorder()` and `add_middleware(MetadataMiddleware)` |
 | `projection.py` | `.build-kit/CLAUDE.md` → *Projection runners*; needed by the **materialized** approach only |
 | `tests/unit/test_projection.py` | ditto — the upgrade tripwire that pairs with `projection.py`; **its absence is invisible**, since a suite passes just as green without it |
-| `/healthz` in `main.py` | `.build-kit/CLAUDE.md` → *Supervising projections*; required once a supervisor exists — the **materialized** approach registers one |
+| `health.py` | `.build-kit/CLAUDE.md` → *Supervising projections*; holds the `/livez` and `/readyz` routes, required once a supervisor exists — the **materialized** approach registers one |
+| `auth.py` | `.build-kit/CLAUDE.md` → *Authentication and authorisation*; needed once this slice's screen names an actor — **its absence is invisible**, since an unguarded view answers 200 to anyone |
 
 A missing module is an incomplete setup, not an opt-out — in particular, **do not skip a slice's instrumentation because `telemetry.py` is absent.** Create what is missing, run the test suites, and commit it on its own as a `chore:` **before** starting the slice: a shared-runtime module folded into a `feat:` commit is unreviewable and reads as slice-specific when it is not.
 
@@ -108,9 +109,11 @@ ViewHostArrivals   + tags=[f"host:{host_id}"]  ->  GET /hosts/{host_id}/upcoming
 SearchAvailableStays (no single entity)        ->  GET /available-stays?from=…&to=…
 ```
 
-4. **Check the path is free.** `grep` it in `docs/openapi.json` — the committed spec is the source of truth for what already exists (`.build-kit/CLAUDE.md` → *The OpenAPI spec is the source of truth*). Two views over the same entity are fine and expected (`/dogs/{dog_id}/profile` and `/dogs/{dog_id}/history`); two views on the *same path* are a bug.
+4. **Check the path is free — and that nothing already registered can match it.** `grep` it in `docs/openapi.json` — the committed spec is the source of truth for what already exists (`.build-kit/CLAUDE.md` → *The OpenAPI spec is the source of truth*). Two views over the same entity are fine and expected (`/dogs/{dog_id}/profile` and `/dogs/{dog_id}/history`); two views on the *same path* are a bug. A literal segment where an existing path has a parameter is a subtler bug: `GET /dogs/strays` never reaches its own handler once `GET /dogs/{dog_id}` is registered ahead of it, and the spec shows both paths quite happily. Keep collection views at the root — `GET /stray-dogs` — rather than depending on registration order (`.build-kit/CLAUDE.md` → *Never let a literal segment sit where a path parameter could match it*).
 
-The slice name still has to be traceable, so it moves into the OpenAPI metadata: `tags=["snake_case({SliceName})"]` on the router and `operation_id="snake_case({SliceName})"` on the route.
+5. **Tag the router with the entity, not the slice** — `tags=["dogs"]`, the same pluralised kebab-case kind you took from the boundary tags in step 1. That is what groups this view with every command and every other view over the same entity in `/docs`; a per-slice tag renders a flat list of one-endpoint sections. A collection view has no entity in its path but still has one as its **subject** — `GET /course-catalogue` is tagged `courses`, not `course-catalogue`. Reuse the exact spelling an existing slice already uses for that entity — `grep '"tags"' docs/openapi.json` — or the two render as separate groups.
+
+The slice name still has to be traceable, so it moves into `operation_id="snake_case({SliceName})"` on the route. That, not the tag, is what links the endpoint back to the slice that built it.
 
 ---
 
@@ -190,6 +193,29 @@ This applies to **both** approaches, and both references implement it in their S
 Both come from `src/snake_case({ProjectName})/view.py` (`PositionAtLeast`, `VIEW_RESPONSES`, `NOT_FOUND_RESPONSE`, `is_behind`, `view_headers`, `too_early`) — a view route imports them, it does not restate them. `VIEW_RESPONSES` covers the 200 and the 425; a single-entity view that can 404 spreads `NOT_FOUND_RESPONSE` in alongside it, so the position header is documented on that response too. The position itself is `view.last_known_position` for an on-demand view and `materialized_position(view)` for a materialized one.
 
 This is what makes read-your-writes checkable: a client keeps the `position` from a command's 201 and polls the view with it, on whatever interval it chooses. **The route never blocks and never waits** — no `view.wait()` in a handler.
+
+---
+
+## The actor rule
+
+This applies to **both** approaches, and both references wire it in their Step 4. The
+slice's **screen** element names the lane that may read this view; decide the rule before
+writing the route.
+
+A read rule is the one most easily left out, because an open `GET` breaks nothing visible —
+it only shows the wrong person somebody else's data, quietly and for as long as the route
+exists. Where the view is addressed by a subject's own id (`/students/{student_id}/...`),
+the rule is almost always **ownership**: the id in the path must equal the one the caller's
+token names.
+
+- **The project has `src/snake_case({ProjectName})/auth.py`** — use the `require_*`
+  dependency for the screen's lane, in the decorator's `dependencies=[...]`.
+- **It has no `auth.py` and this slice's screen names an actor** — create it first and
+  commit as a `chore:`, per `.build-kit/CLAUDE.md` → *Authentication and authorisation*.
+- **The board draws the screen in more than one actor's lane** with no rule distinguishing
+  them (a public catalogue, say) — require identity alone, and do not invent a narrower
+  rule the board does not show. Equally, do not widen an owner-scoped view so an
+  administrator can read it: that is a new slice with its own screen.
 
 ---
 

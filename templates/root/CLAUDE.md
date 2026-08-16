@@ -24,12 +24,14 @@ Every new Python module must satisfy these before it can be committed:
 - **String exception messages** go into a variable first, then `raise` (`EM101`).
 - **Trailing commas** in multi-line calls / literals (`COM812`).
 - **Imports sorted** — first-party is `src` / the project package name (`I001`).
+- **A forwarding `**kwargs` stays unannotated.** `ANN003` (missing annotation) is in `[tool.ruff.lint] ignore`; annotating it `Any` to "fix" that trips `ANN401` instead, so the module cannot be committed either way. This comes up wherever a subclass forwards constructor arguments it does not name — confirm the ignore is still present before relying on it.
 
 ## FastAPI / Pydantic gotchas
 
 - **Depend on `Annotated[T, Depends(...)]`, not `T = Depends(...)`.** The old form trips `FAST002` and `B008`.
 - **Pydantic model fields need runtime type imports.** `from __future__ import annotations` + PEP 563 is fine for everything *except* types that appear as `BaseModel` fields — Pydantic can't rebuild the schema when the class is under `TYPE_CHECKING`. Import such types at runtime and silence `TC003` with a `# noqa: TC003` comment on that specific line.
 - **Dependency factories read from `request.state`, never `lru_cache`.** `get_application` (state-change / on-demand views) and per-slice view getters such as `get_snake_case({SliceName})_view` (materialized views) read the object the lifespan already yielded into `request.state` — they don't construct or cache anything themselves. `lru_cache` has no teardown hook and would pin the first test's instance across every later test; since nothing here uses it, integration tests need no `dependency_overrides` at all.
+- **A dependency that sets a contextvar must be `async def`.** A sync `def` dependency runs in the threadpool on a copied context, so the value never reaches the route — silently. See *Authentication and authorisation*.
 - **A dependency's parameter types must be importable at runtime.** `def get_application(request: Request)` with `Request` under `TYPE_CHECKING` makes FastAPI fail to resolve the annotation and silently treat `request` as a *query parameter* — every call then 422s with `{'loc': ['query', 'request'], 'msg': 'Field required'}`. Import such types at runtime and silence `TC002` with a `# noqa` on that line, same as for Pydantic field types.
 
 ## Observability
@@ -48,7 +50,7 @@ OpenTelemetry covers three seams the library gives no help with: the command pat
 - **Only write `traceparent` when the carrier is non-empty after `inject()`.** Under a no-op tracer the span context is invalid and `inject()` writes nothing; don't turn that into a `{"traceparent": None}` entry.
 - **On extract, guard `span_ctx.is_valid` before building a `Link`.** Events written while telemetry was off carry no traceparent, and events replayed by `drain()` may link to traces already outside the retention window — neither is a bug.
 - **`process_event` spans are links, never children.** Two independent reasons: the producing span ended long before (often minutes), and `BaseProjectionRunner`'s processing thread is a bare `threading.Thread`, which does **not** inherit contextvars — so ambient propagation is not merely wrong here, it is impossible. Use `SpanKind.CONSUMER` with a `Link`, per the OTel messaging conventions for temporally decoupled producers and consumers.
-- **Instrumentation must never swallow an exception.** A span context manager that suppresses is the blanket `try/except` around `process_event` wearing a different hat: it advances past a poison event and diverges the view from the log permanently while `/healthz` still reports 200. Record the exception on the span and **re-raise**, so the supervisor still sees the thread die.
+- **Instrumentation must never swallow an exception.** A span context manager that suppresses is the blanket `try/except` around `process_event` wearing a different hat: it advances past a poison event and diverges the view from the log permanently while `/livez` and `/readyz` both still report 200. Record the exception on the span and **re-raise**, so the supervisor still sees the thread die.
 - **Guard `None` in metrics.** `recorder.head()` and `max_tracking_id()` both return `int | None`. Before a projection has processed anything its lag is *undefined*, not zero — skip the observation rather than reporting a fake backlog.
 - **Both spans set a `correlation_id` attribute** — `command_span` off the context, `consumer_span` off the envelope, since the projection thread inherits no contextvars. That makes traces and the event log **joinable in both directions** without either becoming the other's source of truth. See *Event metadata*.
 - **`opentelemetry-api` is a required dependency; only the *SDK* belongs to the `telemetry` extra, and the `dev` env alone.** Split them deliberately: `telemetry.py` and the `do()` override import from the API at module scope, so an API that is merely optional breaks every suite at import time — the no-op path is an API-level proxy to `NoOpTracer` and still needs the API installed. Put `opentelemetry-api` in `[project] dependencies` and **not** in the extra as well; listing it in both lets the extra pin or reinstall it independently of the base requirement. The extra holds sdk/exporter/instrumentation only. The test suites deliberately do not install *that*, so they exercise the no-op path. Don't add the SDK to a test env to assert on spans; construct an in-memory provider inside the test instead.
@@ -58,14 +60,83 @@ OpenTelemetry covers three seams the library gives no help with: the command pat
 Every recorded event carries three general-purpose keys in `TaggedEvent.metadata`: `correlation_id` (the flow it belongs to), `causation_id` (the event that caused it), and `created_at` (when the unit of work that wrote it ran). They ride on the **envelope, not the `Decision`**, so adding them changes no event schema and needs no migration.
 
 - **`src/snake_case({ProjectName})/metadata.py` is shared runtime, written once at *First-time project setup*.** The module and its tests are in **`.build-kit/references/metadata.md`** — copy them from there rather than deriving them from the bullets below, which are the *why*, not the source. Same repair rule as `telemetry.py`: a project missing it was set up incompletely, so create it and its wiring first and commit as a `chore:`.
-- **Metadata is seeded centrally, at exactly two places.** `MetadataMiddleware` puts a `correlation_id` in context per HTTP request; `{ProjectName}App.do` seeds `created_at` always, and `correlation_id` only when absent. **Slices and routes never touch metadata** — a slice that reaches for it is a slice that will disagree with the next one.
+- **Metadata is seeded centrally, at two places — three once a project has actors.** `MetadataMiddleware` puts a `correlation_id` in context per HTTP request; `{ProjectName}App.do` seeds `created_at` always, and `correlation_id` only when absent; and, in a project with `auth.py`, the auth dependency seeds the caller's `principal_id`/`principal_type` (see *Authentication and authorisation*). Each is the only place that knows its fact — the request, the unit of work, the caller. **Slices and routes never touch metadata** — a slice that reaches for it is a slice that will disagree with the next one.
 - **`MetadataMiddleware` must be pure ASGI, not `BaseHTTPMiddleware`.** The latter runs the endpoint in a separate anyio task, so a contextvar set in its `dispatch` never reaches the route and the metadata silently arrives empty. This is the single most likely way to ship a `correlation_id` that is always freshly minted and never the client's.
 - **A client-supplied `correlation_id` is sanitised, never trusted.** It lands in a `jsonb` column, the logs, and a response header, so bound it and reject control characters. Replace an unusable one outright rather than truncating: a stored id is then either exactly what the client sent or one we minted, never a mangled prefix of the two.
 - **`causation_id` is derived locally, always, and is never accepted from a client.** The invariant it buys is that every `causation_id` resolves to an event uuid in our own log. That is also why a **root command carries no `causation_id` at all**: an HTTP command has no causing *event*, and minting an id that resolves to nothing would break exactly the invariant that justified rejecting the client's. A root is still unambiguous — `correlation_id` present, `causation_id` absent.
 - **`created_at` uses explicit UTC, not the library's `datetime_now_with_tzinfo()`.** That honours `TZINFO_TOPIC`, and the timestamp on a permanent log record should not be reconfigurable by an environment variable set for unrelated reasons. It is stamped per command, not per flow: an automation's command is a later unit of work than the trigger that caused it.
 - **This is not a substitute for `traceparent`, and does not replace it.** They differ in lifetime (permanent versus the collector's retention window), in availability (always versus off unless an exporter is configured — every test env runs a no-op tracer), and in granularity (`causation_id` is a stored event's uuid, so it cannot be derived from a span id). Keep both, and make them **joinable** via the span attribute described under *Observability*.
 - **Metadata is not queryable and is not part of the append condition.** `DcbQueryItem` is `types + tags` only. Any dedup or idempotency keyed on metadata can only ever be read-then-write, with a race window. The DCB-native way to make a command idempotent is a `command:<key>` tag inside `consistency_boundary()`, not a metadata lookup.
-- **Adding a key later — `source`, `actor`, a tenant id — is a one-line change in `metadata.py` and nowhere else.** If a proposed key needs edits in a slice, it is in the wrong place.
+- **Adding a key later — `source`, a tenant id — is a one-line change in `metadata.py` and nowhere else.** If a proposed key needs edits in a slice, it is in the wrong place. `principal_id`/`principal_type` were added exactly that way.
+
+## Authentication and authorisation
+
+A board's actors are not decoration: each slice's **screen** element names the lane that may
+call it, and a route that ignores its lane lets any caller drive any command. Add this the
+first time a project needs it; a project whose board has one anonymous public surface and
+nothing else legitimately has no `auth.py`.
+
+- **`src/snake_case({ProjectName})/auth.py` is shared runtime, written once**, like
+  `metadata.py` — but unlike it there is no reference file to copy, because its contents are
+  dictated by the board's actor lanes and differ per project. What follows is the shape, not
+  a source to transcribe.
+- **Derive the rules from the slices, not from guesswork.** Read the screen lane off each
+  `.build-kit/.slices/{context}/*/slice.json` and write the route/actor table down before
+  writing any dependency. A rule that does not trace back to a lane is a rule the business
+  never asked for.
+- **One `Principal` model, one `parse_token`, several `require_*` dependencies.**
+  `parse_token` is the **entire swap surface**: a fake token today, JWT signature
+  verification against a JWKS endpoint later, with no route, test, or dependency changing.
+  Keep everything else — the model, the dependencies, the route wiring — ignorant of the
+  credential's format.
+- **`principal_id`, not `user_id`, and a `principal_type` beside it.** Machine callers are
+  normal — a webhook posted by an upstream system has no person behind it, and an event
+  log that says otherwise is permanently wrong. OAuth2 standardises no principal-type
+  claim (RFC 6749 distinguishes *grants*; Azure AD, Cognito, Google Cloud IAM and Keycloak
+  each invented their own), so a project-level `user`/`service` enum is the normal thing to
+  have. Two keys rather than one composite `user:...` string keeps both queryable in the
+  `jsonb` column without substring matching.
+- **The auth dependency must be an `async def` *generator*.** This is the trap. A sync `def`
+  dependency runs in the threadpool on a **copied** context, so a contextvar set there never
+  reaches the route — and nothing fails: the request still answers 201 and the events are
+  simply recorded with no principal, silently and unrecoverably. The `with
+  put_metadata_in_context(...): yield principal` form also restores the context on the way
+  out, which a plain `async def` returning a value cannot. Same class of mistake as
+  `BaseHTTPMiddleware` under *Event metadata*, and it deserves the same standing regression
+  test: assert on the **recorded event's** metadata, not on the response code.
+- **Wire rules through the decorator's `dependencies=[...]`, not a handler parameter.** The
+  check completes inside the dependency, so the handler never needs the `Principal` back —
+  and a route body that never sees it cannot start branching on it. One line per route, no
+  slice changes.
+- **An ownership rule declares the path parameter itself.** A dependency that takes
+  `student_id: str` has it resolved from the path by FastAPI and hands it in, so one
+  dependency serves every `/students/{student_id}/...` route. Comparing it to the token's id
+  is what stops a student acting on somebody else's account — the case that is easy to
+  forget precisely because the happy path looks identical.
+- **`HTTPBearer(auto_error=False)`, always.** Left to itself it answers a *missing*
+  `Authorization` header with **403**, which tells an anonymous caller they were identified
+  and refused, and omits the `WWW-Authenticate` challenge RFC 7235 requires. Take the
+  `None` and raise the 401 yourself. Keep the split honest throughout: **401 = not
+  identified** (missing or malformed credential), **403 = identified and refused**.
+- **An automation's events carry no principal, deliberately.** A projection thread has no
+  request and no caller, so there is nothing to record; `causation_id` already leads a
+  reader back to the authenticated event that triggered it. Inventing a `system` principal
+  would assert an authentication that never took place. Assert the *absence* in a test, so
+  a later "helpful" copy of the trigger's principal is caught.
+- **Don't add a policy engine for this.** Casbin, Oso and OPA earn their keep when roles
+  multiply beyond the board's lanes, when policy must change without a redeploy, when there
+  is multi-tenancy or permission inheritance, or when authorisation decisions need their own
+  audit log distinct from the event log. Short of that they move policy out of reach of
+  ruff, pyrefly and pydoclint, cost a full lock-file regeneration (see *Regenerating lock
+  files*), and still leave the ownership rule written by hand.
+- **Every route gets two tests beyond its happy path**: a 401 with no token and a 403 as the
+  wrong actor. For a destructive command, seed the state that would have made it *succeed*,
+  so the test proves the rule refused it rather than the precondition. `/livez` and
+  `/readyz` stay unauthenticated — a probe that needs a credential is a probe that reports
+  the credential's health.
+- **`docs/openapi.json` is the check that the wiring took.** Every guarded route should show
+  `security: [{"HTTPBearer": []}]` and the probes none. It is regenerated by the pre-commit
+  hook, never hand-edited.
 
 ## Test layout
 
@@ -82,7 +153,7 @@ Every recorded event carries three general-purpose keys in `TaggedEvent.metadata
 
 Before the first build skill runs in a new project, check whether the files below exist. If not, create them in this order before proceeding with the skill — the build skills themselves assume all of this is already in place. Every build skill's **Step 0** re-checks this list, so a project that was set up incompletely is repaired at the next slice rather than carried forward.
 
-The shared runtime is these eight modules under `src/snake_case({ProjectName})/`:
+The shared runtime is these ten modules under `src/snake_case({ProjectName})/`:
 
 | Module | Created |
 |---|---|
@@ -94,12 +165,14 @@ The shared runtime is these eight modules under `src/snake_case({ProjectName})/`
 | `view.py` | setup |
 | `main.py` | setup |
 | `projection.py` | the first time a projection slice is built (see *Projection runners*) |
+| `health.py` | the first time a slice registers a **supervisor** (see *Supervising projections*) |
+| `auth.py` | the first time a slice's screen names an **actor** to enforce (see *Authentication and authorisation*) |
 
-Each is written **once** per project and is never a per-slice artefact. `projection.py` is the one deferred to first use, because it is dead code in a project with no projection — but Step 0 still checks for it, and a projection slice that finds it missing creates it before the slice, not alongside it.
+Each is written **once** per project and is never a per-slice artefact. The last three are deferred to first use, because each is dead code until the board asks for it — but Step 0 still checks for them, and a slice that finds one missing creates it before the slice, not alongside it.
 
-The `/healthz` route is deferred on the same terms: the slice that registers the **first** supervisor adds it to `create_app()`, whatever that slice's type. It has nothing to report until a supervisor exists, and a supervisor without it is a projection that can die unobserved. See *Supervising projections* → *The `/healthz` route*.
+`health.py` holds the `/livez` and `/readyz` routes, and the slice that registers the **first** supervisor adds it, whatever that slice's type. The routes have nothing to report until a supervisor exists, and a supervisor without them is a projection that can die unobserved. See *Supervising projections* → *The `/livez` and `/readyz` routes*.
 
-The order below matters: `telemetry.py` imports `CommandSlice` from `command.py` and `CORRELATION_ID_KEY` from `metadata.py`, `application.py` imports `command_metadata` from `metadata.py` and `command_span` from `telemetry.py`, `main.py` imports `MetadataMiddleware` from `metadata.py`, and `view.py` imports `{ProjectName}App` from `application.py`. `metadata.py` imports nothing of the project's own, which is why it can come this early.
+The order below matters: `telemetry.py` imports `CommandSlice` from `command.py` and `CORRELATION_ID_KEY` from `metadata.py`, `application.py` imports `command_metadata` from `metadata.py` and `command_span` from `telemetry.py`, `main.py` imports `MetadataMiddleware` from `metadata.py`, and `view.py` imports `{ProjectName}App` from `application.py`. `metadata.py` imports nothing of the project's own, which is why it can come this early. When `auth.py` arrives later it imports its two key constants from `metadata.py` too, and the slices' `routes.py` modules import their `require_*` dependency from it.
 
 1. **Resolve every `TODO` placeholder in `pyproject.toml`.** `grep -n TODO pyproject.toml` to find them all: `[project] name`, `description`, `authors`; `packages = ["src/TODO"]` and `version-file = "src/TODO/_version.py"`; `[tool.coverage.paths] source`/`omit`; `[tool.ruff] exclude`; `[tool.ruff.lint.isort] known-first-party`; `pyrefly check src/TODO`; and the three `--cov=TODO` occurrences in the `unit-tests`/`acceptance-tests`/`integration-tests` scripts. Never create `src/snake_case({ProjectName})/_version.py` by hand — `hatch-vcs` generates it at build time and it's gitignored.
 2. **Create `src/snake_case({ProjectName})/__init__.py`** — copyright header plus a one-line module docstring naming the package.
@@ -336,7 +409,7 @@ missing a piece of it will otherwise keep producing slices that quietly lack it.
 - **One `{ProjectName}App` per process**, created by the FastAPI lifespan in `src/snake_case({ProjectName})/main.py`; slices never subclass `DcbApplication`. Separate `DcbApplication()` instances each get their own in-memory store (`PERSISTENCE_MODULE` defaults to `eventsourcing.dcb.popo`), so per-slice applications silently cannot see each other's events — an event written through one endpoint would be invisible to the next.
 - **The lifespan *yields* `{"dcb_app": app}`; `get_application` reads `request.state.dcb_app`.** Starlette merges the yielded mapping into the lifespan scope state and shallow-copies it into every request scope, so handlers can't clobber it. Do not assign to `app.state` — it is a different object that never receives lifespan state.
 - **`DcbApplication` is a context manager.** Hold it with `with`, never `lru_cache` — the latter has no teardown hook, so `close()` (and, under Postgres, the connection-pool teardown) never runs.
-- **Adding a slice touches `main.py` only** — one router import plus one `include_router` line. `application.py` is never edited *by a slice*, because `do()` is generic over any `Slice`. (The one process-wide `do()` override is written once and is not a per-slice edit — see *Command outcomes* and *Observability*.)
+- **Adding a slice touches `main.py` only** — one router import plus one `include_router` line, appended to the block. Registration order is load-bearing when a literal segment could be matched by another route's path parameter; see *API addressing* → *Never let a literal segment sit where a path parameter could match it*. `application.py` is never edited *by a slice*, because `do()` is generic over any `Slice`. (The one process-wide `do()` override is written once and is not a per-slice edit — see *Command outcomes* and *Observability*.)
 - **Materialized views and automations use the shared application too.** They are *not* exempt. `ProjectionRunner` takes an application *class* and constructs its own instance, so it is unusable here — see *Projection runners* below for what to use instead.
 
 ### API addressing
@@ -351,28 +424,52 @@ tags = [f"licence:{licence_id}"]   ->   /licences/{licence_id}/...
 
 That is what makes an address checkable: a route whose entity segment disagrees with the slice's boundary tag is a bug, not a style preference.
 
+**A command's URL carries the domain's own verb; a view's carries a noun.** That asymmetry is deliberate. `POST` says only "something happened here"; the action has to be named somewhere, and the domain already named it on the board (`Subscribe Student`, `Change Course Capacity`). Nominalising that back into a noun-phrase resource (`/subscriptions`, `/capacity-changes`) invents a collection nobody models, and re-frames a decision the business makes as a row a client inserts. `GET`, by contrast, *is* the verb — a view path that repeats it (`/list-catalogue`) says the same thing twice.
+
 | Case | Path |
 |------|------|
-| Command on an existing entity | `POST /{entities}/{entity_id}/{intention}` — `POST /licences/{licence_id}/cancellation-requests` |
-| Command that creates the entity (id generated, or the tag is on the thing being created) | `POST /{intention}` — `POST /user-registrations` |
-| Global boundary (`tags=[]`) | `POST /{intention}` at root — justify it in the docstring, same rule as the empty selector |
+| Command on an existing entity | `POST /{entities}/{entity_id}/{action}` — `POST /licences/{licence_id}/cancel` |
+| Command that creates the entity | `POST /{entities}/{action}` — `POST /users/register` |
+| Global boundary (`tags=[]`) | `POST /{entities}/{action}` on the command's subject; if no subject can be named, `POST /{action}` at root — justify it in the docstring, same rule as the empty selector |
 | Two-entity boundary (rare) | Nest under the entity the command *mutates*; the other stays in the body |
 | Single-entity view | `GET /{entities}/{entity_id}/{situation}` — `GET /dogs/{dog_id}/profile` |
 | Collection / search view | `GET /{situation-plural}?params` — `GET /available-stays?from=…&to=…` |
+| Inbound webhook (external event) | `POST /webhooks/{external-event}` — `POST /webhooks/student-registered` |
 
 - **`{entities}`** — the boundary tag's kind, pluralised, kebab-case.
-- **`{intention}`** — the command's verb nominalised to a plural noun of intent: cancel → `cancellation-requests`, register → `registrations`, approve → `approvals`, withdraw → `withdrawal-requests`, book → `booking-requests`. Where the nominalisation is awkward, fall back to `{verb}-requests`.
+- **`{action}`** — the command's own name with the noun the path already carries **dropped**, the verb kept, and the command's *object* appended when it has one. The entity is in the path; repeating it is noise.
+  ```
+  AdminCancelLicence  + /licences/{licence_id}/  ->  cancel
+  ChangeCourseCapacity + /courses/{course_id}/   ->  change-capacity
+  SubscribeStudent     + /students/{student_id}/ ->  subscribe-to-course   (object: course)
+  RegisterCourse       + /courses/              ->  register
+  ```
+  Keep a qualifier when dropping it would collide: if both `AdminCancelLicence` and `CustomerCancelLicence` exist, they are `admin-cancel` and `customer-cancel`, not two routes called `cancel`. Imperative verb, never a gerund or a noun — `cancel`, not `cancelling` or `cancellation`.
+- **A creating command keeps its id in the body.** `POST /courses/register` carries `course_id` as body data even when the client supplies it, because an id for a thing that does not exist yet is not an address. This is the one case where the id is *not* lifted to a path parameter.
 - **`{situation}`** — what the reader is looking at, not what the projection is called: `profile`, `itinerary`, `upcoming-arrivals`, `cancellation-context`. `ViewDogProfile` is the slice; `profile` is the situation.
-- **The slice name still has to be traceable, so it moves to the OpenAPI metadata** — `tags=["snake_case({SliceName})"]` on the router and an explicit `operation_id="snake_case({SliceName})"` on the route. The generated spec is what links an endpoint back to the slice that built it.
+- **`{external-event}`** — the *external* event's own name, **past participle**, kebab-case: `student-registered`, `payment-settled`. Not an imperative. Read the board before choosing it: an automation slice fed from outside has an external event upstream of the automation and a command *downstream* of it, so the thing crossing the wire is the event, and the command is ours to issue afterwards. `POST /students/register` states the opposite — that the caller is instructing us and that we may decline — when in fact the upstream system has already decided and our only honest answers are "recorded" and "retry me". The endpoint's behaviour has to agree: a redelivery is absorbed, because a sender's retry is not a second registration.
+- **The OpenAPI tag names the entity, never the slice** — `tags=["{entities}"]` on the router, reusing the same pluralised, kebab-case entity kind as the path's `{entities}` segment. A tag is the only grouping a reader of `/docs` or a generated client gets, so one tag per slice groups nothing: it renders as a flat list of one-endpoint sections in build order. Tagging by entity puts every command and every view over a course under `courses`, whichever slice built it.
+  - Every **command** path starts with `{entities}`, so for commands the tag is exactly the first path segment — including the creating ones: `POST /courses/register` is tagged `courses`.
+  - A **collection view** sits at the root, so its tag is *not* its first segment. Take what the collection is **of**: `GET /course-catalogue` is tagged `courses`.
+  - A genuinely global boundary (`tags=[]`) still has a subject; tag it with that. If no entity can be named, the slice is probably mis-scoped.
+  - **An inbound webhook is tagged `webhooks`, not by its entity** — the one deliberate exception. `/webhooks/` is an operational boundary rather than a naming one: these are the paths an external retry loop hammers, that need signature verification and at-least-once tolerance, and that no first-party client should ever call. Filing `student-registered` under `students` puts it in the group a student-facing client browses and implies it is theirs to call.
+- **The slice name still has to be traceable, so it lives in `operation_id`** — an explicit `operation_id="snake_case({SliceName})"` on the route. That, not the tag, is what links an endpoint back to the slice that built it in the generated spec.
 - **The full path goes on the decorator; the router carries no `prefix`.** One greppable path string per slice, no path parameters hidden in a prefix, and no trailing-slash wart.
-- **The entity id is a path parameter, not a body field**, whenever the command is nested under an entity. Drop it from the request model and pass it alongside: `{SliceName}Slice(licence_id=licence_id, **body.model_dump())`.
-- **Operational routes are exempt.** `/healthz` and anything like it is infrastructure, not domain — leave it flat.
+- **The entity id is a path parameter, not a body field**, whenever the command is nested under an *existing* entity. Drop it from the request model and pass it alongside: `{SliceName}Slice(licence_id=licence_id, **body.model_dump())`. A creating command is the exception noted above.
+- **Operational routes are exempt from the entity scheme, but not from tagging.** `/livez`, `/readyz` and anything like them are infrastructure, not domain — leave the path flat and tag them `infrastructure`, so `/docs` and generated clients group them apart from the domain surface rather than scattering them untagged.
+
+**Never let a literal segment sit where a path parameter could match it.** Starlette walks the route table in registration order and serves the **first full match**, so `GET /courses/{course_id}` registered before `GET /courses/catalogue` swallows every catalogue request and answers it from the *detail* handler with `course_id="catalogue"` — a 404 from the wrong route, with no warning at import time and no error in the log. Nothing in this kit enforces an ordering, and `include_router` lines are appended per slice, so the safe order today is an accident of build order rather than a property anyone maintains.
+
+- **Prefer addresses that cannot collide over an ordering you have to remember.** This is why a collection view keeps a root-level address — `GET /course-catalogue`, never `GET /courses/catalogue`. It leaves `/courses/{course_id}` free forever, and costs nothing.
+- The command scheme is already safe by construction: a command path always ends in `{action}`, a literal, and never bottoms out at a bare `POST /{entities}/{entity_id}`. `POST /courses/register` and `POST /courses/{course_id}/change-capacity` differ in segment count and cannot shadow each other.
+- If a literal and a parameterised sibling ever genuinely must coexist, register the **literal first** and leave a comment at both `include_router` lines saying the order is load-bearing. Prefer redesigning the address instead.
+- **`grep` the committed spec before choosing a path** — see *The OpenAPI spec is the source of truth*. A shadowed route is invisible there (both paths appear, correctly), so the spec catches duplicates but **not** shadowing. That check is yours to make.
 
 ### The OpenAPI spec is the source of truth
 
 Addresses now take per-slice judgement, so nothing guarantees a rebuild lands on the same URL. `docs/openapi.json` is the record that closes that gap: it is generated from the real `create_app()`, committed, and regenerated by the `hatch-docs-openapi` pre-commit hook on every change. A renamed or colliding endpoint shows up as a diff in a file under review rather than as a silent break.
 
-- **Read it before choosing a path.** `grep` the spec for the path you intend to use; if it is taken, the slice needs a different intention noun (or you have mis-identified the entity).
+- **Read it before choosing a path.** `grep` the spec for the path you intend to use; if it is taken, the slice needs a different action verb (or you have mis-identified the entity). Check for *shadowing* too, not just exact duplicates: a new parameterised path that could match an existing literal one is a break the spec cannot show you.
 - **Never hand-edit it.** Change the route, run `hatch run docs:openapi`, stage the result.
 - It does not exist until the first slice with a route is built — that is expected, not a setup step you missed.
 
@@ -386,7 +483,8 @@ A command route answers with the ids of the events it recorded and the position 
 - **The outcome rides on the slice, so `do()` keeps its `-> TSlice` signature.** Returning a union would break the base class contract and every on-demand view route, which depend on `do()` handing the perspective back.
 - **`position` is the append position — the last event of the batch.** It is the value `TrackingRecorder.wait(context_name, notification_id, timeout)` polls, which is what makes read-your-writes possible for a caller.
 - **A successful command answers 201, never 200.** Every command that succeeds appends events to the log, so the response *is* a creation — the verb in the slice name is beside the point (`UnsubscribeStudent` creates a `StudentUnsubscribed` event just as `RegisterCourse` creates a `CourseRegistered` one). Uniform status means a client never has to know which command it called to know what success looks like.
-- **Nothing recorded means HTTP 204 — the only other success code.** `do()` skips `save()` when `new_decisions` is empty, so there is no position to report. Unreachable through the API while every slice either emits or raises — cover it with a unit test that drives a silent `CommandSlice` directly.
+- **Nothing recorded means HTTP 204.** `do()` skips `save()` when `new_decisions` is empty, so there is no position to report. Unreachable through the API while every slice either emits or raises — cover it with a unit test that drives a silent `CommandSlice` directly.
+- **An inbound webhook answers 202, not 201 — the one exception, and it is about who did the work.** A webhook route records the *external* event; the command the domain actually runs is issued later by the automation that follows it, so at the moment the response goes out the thing the sender named has not happened yet. 201 would claim it had. 202 says "recorded, and I will act on it", which is both true and what a webhook sender expects. The 204 branch is unchanged, and so is the body — the caller still gets a `position` and still polls the view with `X-Position-AtLeast`, which is the only way it can find out when the automation has caught up. Do not generalise this to ordinary command routes: their work *is* done when they answer.
 
 ### View positions
 
@@ -431,40 +529,72 @@ One unhandled exception in `process_event` **permanently kills** the processing 
 - **One process-wide `ProjectionSupervisor`** owns a single watchdog thread over every registered projection. It probes with `run_forever(timeout=0)` (non-blocking; re-raises the stored error) and rebuilds dead runners via the registered factory.
 - **A restart resumes where the dead runner stopped.** Tracking is committed atomically with each view mutation, so a fresh runner over the same view subscribes at `max_tracking_id` — no loss, no replay from zero.
 - **Count restarts by position, not by count.** If `max_tracking_id` advanced since the last death the projection made progress, so reset the counter; unchanged means the same poison event, so increment. Without this, unrelated transient faults accumulate and eventually stop a healthy projection for good.
-- **Past `max_restarts`, stop and report.** The runner stays dead and surfaces in `supervisor.failures()`, which `/healthz` turns into a 503. A view frozen at a known position is honest; one that skipped an event is silently wrong forever.
+- **Past `max_restarts`, stop and report.** The runner stays dead and surfaces in `supervisor.failures()`, which both `/livez` and `/readyz` turn into a 503. A view frozen at a known position is honest; one that skipped an event is silently wrong forever.
 - **Do not wrap `process_event` in a blanket `try/except`.** Swallowing an event and advancing past it diverges the view from the log permanently while health checks still report 200. Automations keep their targeted guard around the *command port* (`_fire`), where the lingering ledger entry is itself the signal — which only holds while entries linger for one reason, so `_fire` discards the entry when the command's own idempotency guard says the work already landed.
 - **The watchdog is a thread, not an asyncio task,** because tearing a runner down makes two unbounded `Thread.join()` calls and may block on a dead database socket. On the event loop that would stall every request; on a thread it degrades one projection.
-- **`/healthz` reports; it never restarts.** Recovery is the supervisor's job, so health checks stay free of side effects.
+- **Health routes report; they never restart.** Recovery is the supervisor's job, so health checks stay free of side effects. Expose the watchdog's own liveness as `is_watching()` alongside `failures()` — a supervisor that has stopped watching is invisible to `failures()` by construction.
 
-#### The `/healthz` route
+#### The `/livez` and `/readyz` routes
 
-**The slice that registers the first supervisor also adds this route** — whichever slice type it happens to be. A supervisor with no health surface is the failure it exists to prevent: past `max_restarts` the runner stays dead, and without this the process answers every request happily while the view sits frozen. If an earlier slice already added it, leave it exactly as it is.
+**The slice that registers the first supervisor also adds these routes** — whichever slice type it happens to be. A supervisor with no health surface is the failure it exists to prevent: past `max_restarts` the runner stays dead, and without this the process answers every request happily while the view sits frozen. If an earlier slice already added them, leave them exactly as they are.
 
-It goes in `create_app()` in `src/snake_case({ProjectName})/main.py`, after the `include_router` lines. There is no module-level `app` to decorate.
+**They are two routes, not one, because an orchestrator asks two questions with two different remedies.** A single probe answers both and so answers neither actionably.
+
+| | `/livez` | `/readyz` |
+|---|---|---|
+| Event store unreachable | 200 | 503 — `event_store` |
+| A projection's own store unreachable | 200 | 503 — `view:<name>` |
+| Terminal projection failure (`supervisor.failures()`) | 503 | 503 — `<name>` |
+| Watchdog thread dead | 503 | 200 |
+
+- **`/livez` — "restart me."** Only unrecoverable in-process state: a runner past `max_restarts` (a fresh process rebuilds it from `max_tracking_id`, so a restart *is* the recovery), or a watchdog thread that has died (nothing will restart a projection from here on, and `failures()` stays empty through the rot because nothing is left to observe a death). It never touches any store.
+- **`/readyz` — "drain me."** Whether this instance can serve correct traffic right now: the same terminal failures, plus a live round trip to the event store *and to every registered projection's store*. Restarting a replica does not bring a store back, and a restart loop across every replica during an outage is strictly worse than every replica sitting unready.
+- **What makes `/livez`'s store-blindness honest is the remedy, not a startup handshake.** Do **not** add a reachability probe to the lifespan: a backend that cannot open its store already raises out of `{ProjectName}App()`, so a misconfigured URI fails startup without one, and the only thing a retry loop there buys is a boot-ordering window a container restart already provides. Liveness covers in-process rot a restart fixes; a dependency outage is not that, whenever it starts.
+- **Probe every registered projection, not a named backend.** Each projection resolves its own infrastructure from a name-scoped environment, so each may hold a connection of its own — and two projections against the same database still get separate pools. Iterate `supervisor.tracking_recorders()` and call `materialized_position(recorder)` on each, deduplicating by `id(getattr(recorder, "datastore", recorder))` so recorders sharing a datastore are one round trip. A new projection is then covered by registering it, with no edit here.
+- **Collect every failure into one 503 body rather than short-circuiting.** An operator reading it during an outage wants the whole list; naming one dependency and stopping reads as "only this one broke". Namespace the projection keys (`view:<name>`) so they cannot collide with the bare names `failures()` uses.
+- **`head()` and `max_tracking_id()` returning `None` is success.** It means the store is reachable and has nothing yet. Only an exception means unreachable — the same `None`-guarding trap as in *Instrumentation*.
+- **Close the response model's `status` field** — `Literal["alive", "ready"]`, not `str`. An open string publishes no contract, so a typo in a return value breaks every generated client with nothing to catch it.
+- **Projection lag is not a readiness condition.** Keep it an observable gauge (below); per-request staleness is already the read side's job via `X-Current-Position` / `X-Position-AtLeast` → 425. A lag threshold is a policy guess that flaps under write bursts and can pull every replica at once during a backlog.
+
+Unlike a single `/healthz`, these no longer fit as closures in `create_app()`: give them their own `src/snake_case({ProjectName})/health.py` with a router, `include_router`'d last, exactly like a slice's.
 
 ```python
-from fastapi import FastAPI, HTTPException, Request, status
+router = APIRouter(tags=["infrastructure"])
 
 
-def create_app() -> FastAPI:
-    """Build the FastAPI application, wiring in every slice's router."""
-    # ... the existing configure_telemetry / instrument_app / include_router lines ...
+def get_supervisor(request: Request) -> ProjectionSupervisor:
+    """Return the process-wide projection supervisor from FastAPI request state."""
+    return request.state.projection_supervisor
 
-    @app.get("/healthz")
-    async def healthz(request: Request) -> dict[str, str]:
-        """Report whether every supervised projection is still running."""
-        failures = request.state.projection_supervisor.failures()
-        if failures:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={name: str(error) for name, error in failures.items()},
-            )
-        return {"status": "ok"}
 
-    return app
+@router.get("/livez", response_model=HealthResponse, operation_id="livez")
+async def livez(
+    supervisor: Annotated[ProjectionSupervisor, Depends(get_supervisor)],
+) -> HealthResponse:
+    """Report whether this process can still recover on its own."""
+    # ... failures() -> 503, then is_watching() -> 503 ...
+
+
+@router.get("/readyz", response_model=HealthResponse, operation_id="readyz")
+def readyz(  # deliberately sync — see below
+    app: Annotated[{ProjectName}App, Depends(get_application)],
+    supervisor: Annotated[ProjectionSupervisor, Depends(get_supervisor)],
+) -> HealthResponse:
+    """Report whether this instance can serve correct traffic right now."""
+    # ... failures() -> 503, then head() and every registered projection's
+    # tracking recorder, each guarded, collected into one 503 ...
 ```
 
-`request.state.projection_supervisor` is the key the lifespan yields — the route reads the supervisor, never a runner and never a view. `Request` must be imported at runtime, not under `TYPE_CHECKING`, or FastAPI mistakes it for a query parameter and the route 422s; see *FastAPI / Pydantic gotchas*. Being an operational route it keeps a flat path and is exempt from the addressing convention in *API addressing*.
+`request.state.projection_supervisor` is the key the lifespan yields — the route reads the supervisor, never a runner and never a view. `Request`, and any type used in a live `Annotated` parameter annotation, must be imported at runtime rather than under `TYPE_CHECKING`, or FastAPI mistakes `Request` for a query parameter and the route 422s; see *FastAPI / Pydantic gotchas*. Being operational routes they keep flat paths and are exempt from the addressing convention in *API addressing*.
+
+**`readyz` is `def`, not `async def`, on purpose.** Every probe it makes is blocking socket I/O, and on the event loop a hung socket would stall every request in the process — the same reasoning that makes the watchdog a thread rather than a task. FastAPI runs a sync handler in the threadpool, so a hung probe degrades one worker instead. `livez` stays `async def`; it only reads in-memory state.
+
+**Bound the probe, or the threadpool is no safer than the event loop.** An unreachable projection store makes this route *slow*, not instantaneous, and by a wider margin than it looks: `max_tracking_id` is wrapped in `@retry(max_attempts=10, wait=0.2)`, and each attempt blocks for the connection-pool checkout timeout — `POSTGRES_CONNECT_TIMEOUT`, which defaults to **30s**. The probe's worst case is therefore **that timeout times ten** — minutes at the default, seconds once the timeout is set low. The shape is what matters; the exact seconds depend on the deployment, so measure them there rather than trusting a number written here. A low timeout still names the dependency in the 503: shortening the probe costs no diagnostic value. Two things break at the default, not one:
+
+- The container probe times out first, so the clean 503 naming the dependency is replaced by an opaque timeout naming nothing.
+- Worse, an orchestrator polling every few seconds stacks probes that each pin a threadpool worker for minutes. The pool is finite (AnyIO defaults to 40), so a *dependency* outage becomes a *total* outage — the routes still serving correctly from the event store queue behind dead probes. That is precisely the failure the liveness/readiness split exists to prevent, reintroduced one layer down.
+
+So set the connect timeout deliberately in deployment config and size the probe timeout above the resulting worst case. Raise them together or neither.
 
 Register each view's lag as an observable gauge alongside it. That is the metric distinguishing "healthy" from "running but hopelessly behind", which `failures()` alone cannot tell you:
 

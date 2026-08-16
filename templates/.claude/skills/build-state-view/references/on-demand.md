@@ -102,6 +102,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 
 from snake_case({ProjectName}).application import {ProjectName}App, get_application
+from snake_case({ProjectName}).auth import require_dog_owner_self  # the slice's actor rule
 from snake_case({ProjectName}).snake_case({Context}).snake_case({SliceName}).projection import {SliceName}View
 from snake_case({ProjectName}).view import (
     NOT_FOUND_RESPONSE,
@@ -112,7 +113,7 @@ from snake_case({ProjectName}).view import (
     view_headers,
 )
 
-router = APIRouter(tags=["snake_case({SliceName})"])
+router = APIRouter(tags=["dogs"])  # the entity, pluralised — see SKILL.md step 5
 
 
 class {SliceName}Response(BaseModel):
@@ -123,11 +124,15 @@ class {SliceName}Response(BaseModel):
     field2: int
 
 
-# The path and the id parameter are the *worked example* (`ViewDogProfile` over
-# `tags=[f"dog:{dog_id}"]`), not placeholder tokens — substitute the entity and
-# situation you settled on in `SKILL.md` → *Addressing the view*.
+# The router tag above, and the path and the id parameter below, are the *worked
+# example* (`ViewDogProfile` over `tags=[f"dog:{dog_id}"]`), not placeholder
+# tokens — substitute the entity and situation you settled on in `SKILL.md` →
+# *Addressing the view*.
 @router.get(
     "/dogs/{dog_id}/profile",
+    # Omit this line only if the board draws no actor for this slice —
+    # see `SKILL.md` → *The actor rule*.
+    dependencies=[Depends(require_dog_owner_self)],
     response_model={SliceName}Response,
     operation_id="snake_case({SliceName})",
     responses={**VIEW_RESPONSES, status.HTTP_404_NOT_FOUND: NOT_FOUND_RESPONSE},
@@ -167,9 +172,9 @@ Notes on the template:
 - **The 425 comes before the 404.** A caller polling for the entity it just created would otherwise be told the entity does not exist and stop.
 - **All three responses carry the position.** The injected `response: Response` covers the 200 only — its headers are discarded when the handler raises or returns a `Response` of its own, which is why the 404 passes `headers=` to `HTTPException` and `too_early()` builds its own. `view_headers()` also emits `Cache-Control: no-store`; that is required, not tidiness (`.build-kit/CLAUDE.md` → *View positions*).
 - **`response_model=` must stay explicit on the decorator.** The return annotation is a union with `Response`, which FastAPI cannot derive a schema from, so the success schema has to be declared — the same reason command routes declare it. The view class is a `Slice`, not a `BaseModel`: map its attributes onto a Pydantic response model explicitly.
-- **The router carries no `prefix`; the full path goes on the decorator.** One greppable path string per slice and no path parameter hidden in a prefix. The slice name lives on in `tags=` and `operation_id=`, which is what links the endpoint back to the slice in the generated spec.
+- **The router carries no `prefix`; the full path goes on the decorator.** One greppable path string per slice and no path parameter hidden in a prefix. The slice name lives on in `operation_id=`, which is what links the endpoint back to the slice in the generated spec; `tags=` groups the endpoint by entity instead, and is deliberately shared with other slices.
 - **The path parameter takes the entity's own name** (`dog_id`), not a generic `entity_id`. The internal `{SliceName}View(entity_id=…)` keyword is unaffected — that is the projection's own interface, not the public one.
-- **Regenerate the spec once the route is wired in** (Step 7): `hatch run docs:openapi`, then stage `docs/openapi.json` with the rest of the slice.
+- **Regenerate the spec once the route is wired in** (Step 7; `.build-kit/CLAUDE.md` → *The OpenAPI spec is the source of truth*), then stage `docs/openapi.json` with the rest of the slice.
 
 The FastAPI/Pydantic house rules this template follows (`Annotated[…, Depends(…)]`, `EM101` message variables, runtime imports for Pydantic field types) are in `.build-kit/CLAUDE.md`. Status codes follow the *Error mapping* table in `SKILL.md`.
 
@@ -253,7 +258,7 @@ File: `tests/integration/snake_case({Context})/test_snake_case({SliceName}).py`
 
 These prove the FastAPI route wires the projection correctly and returns the
 right status codes and bodies. They belong in `tests/integration/` — a separate
-hatch env from acceptance tests.
+test env from acceptance tests.
 
 **Use the shared `client` fixture from `tests/integration/conftest.py`** — do not
 build a local `FastAPI()` and do not register any `dependency_overrides`. That
@@ -349,6 +354,19 @@ def test_snake_case({SliceName})_reports_too_early_when_behind(
 - **Assert `>= 1`, never a literal.** The position is the store head, so it counts every
   event the fixtures seeded, not only the ones this view projects.
 
+### A guarded view needs two more tests
+
+A **401** with no `Authorization` header, and a **403** as the wrong actor — with the data
+seeded, so the test proves the rule refused the read rather than that there was nothing to
+return. Assert `response.json()["detail"]` as well as the status. For an owner-scoped view,
+add a third: the *other* subject reading their **own** account gets 200 and sees none of
+this one's data. That is what distinguishes "the view is scoped by id" from "the rule
+happens to refuse cross-account reads" — two different things, and only the first survives
+a change to the rule.
+
+Take headers from the auth fixtures in `tests/integration/conftest.py`; the `client`
+fixture stays anonymous so each test names the actor it speaks for.
+
 ---
 
 ## Step 7 — Wire the router into the central FastAPI app
@@ -369,12 +387,19 @@ def create_app() -> FastAPI:
 Those two lines are the only per-slice change to `main.py` — the `lifespan` is
 **not** touched, and `src/snake_case({ProjectName})/application.py` is never edited at all.
 
-Once the router is included the route exists on the real app, so **regenerate the
-spec and stage it with the slice**:
+**Append the line to the end of the block; do not reorder the existing ones.**
+Starlette serves the first route whose pattern fully matches, so a path parameter
+registered ahead of a literal it can match silently swallows that literal's requests
+and answers them from the wrong handler — no startup error, no log line. Appending
+keeps every already-working route ahead of yours. If this view's path *could* be
+matched by an existing parameterised path, redesign the address rather than relying
+on the order (`.build-kit/CLAUDE.md` → *Never let a literal segment sit where a path
+parameter could match it*).
 
-```
-hatch run docs:openapi     # rewrites docs/openapi.json
-```
+Once the router is included the route exists on the real app, so **regenerate the
+spec and stage it with the slice** — the project's regeneration command is in
+`.build-kit/CLAUDE.md` → *The OpenAPI spec is the source of truth*, and it
+rewrites `docs/openapi.json` in place.
 
 Confirm the diff adds exactly the path you intended and changes nothing else — a
 diff that *moves* an existing endpoint means this slice took a path another one
@@ -403,7 +428,7 @@ generated, correct, and not a collision — do not try to suppress it.
 
 ```
 docs/
-    openapi.json                                          # REGENERATED, not hand-written — `hatch run docs:openapi`
+    openapi.json                                          # REGENERATED, not hand-written
 src/snake_case({ProjectName})/
     main.py                                               # EDITED, not created — one import + one include_router line
     metadata.py                                           # SHARED RUNTIME — verified in Step 0; this slice type adds nothing to it
